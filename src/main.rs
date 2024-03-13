@@ -4,16 +4,16 @@
 use std::{
     cell::{Cell, SyncUnsafeCell},
     ptr::{null, null_mut},
-    sync::atomic::{AtomicPtr, AtomicUsize},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
 fn main() {
     println!("Hello, world!");
 }
 
-static GLOBAL_GARBAGE_PILE: GlobalInfo = GlobalInfo {
-    pile: ConcLinkedList,
-    epoch: todo!(),
+static GLOBAL_INFO: GlobalInfo = GlobalInfo {
+    pile: ConcLinkedList::new(),
+    epoch: AtomicUsize::new(0),
 };
 
 struct GlobalInfo {
@@ -24,7 +24,7 @@ struct GlobalInfo {
 #[thread_local]
 static LOCAL_INFO: LocalInfo = LocalInfo {
     pile: SyncUnsafeCell::new(vec![]),
-    epoch: SyncUnsafeCell::new(0),
+    epoch: Cell::new(0),
 };
 
 #[thread_local]
@@ -32,8 +32,11 @@ static LOCAL_GUARD: LocalGuard = LocalGuard;
 
 struct LocalInfo {
     pile: SyncUnsafeCell<Vec<Instance>>,
-    epoch: SyncUnsafeCell<usize>,
+    epoch: Cell<usize>,
 }
+
+unsafe impl Send for LocalInfo {}
+unsafe impl Sync for LocalInfo {}
 
 struct LocalGuard;
 
@@ -54,19 +57,62 @@ struct Instance {
 unsafe impl Send for Instance {}
 unsafe impl Sync for Instance {}
 
+pub fn pin() -> LocalPinGuard {
+    let glob = GLOBAL_INFO.epoch.load(std::sync::atomic::Ordering::Acquire);
+    let local_info = &LOCAL_INFO;
+    let local = local_info.epoch.get();
+    if glob == local {
+        if GLOBAL_INFO.epoch.compare_exchange(glob, glob + 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok() {
+            let local_pile = unsafe { &mut *local_info.pile.get() };
+            let mut rem_nodes = 0;
+            for item in local_pile.iter() {
+                if item.epoch == local {
+                    rem_nodes += 1;
+                } else {
+                    break;
+                }
+            }
+            for _ in 0..rem_nodes {
+                local_pile.remove(0);
+            }
+        }
+        // try cleanup global
+        GLOBAL_INFO.pile.try_drain(|val| {
+            val.epoch == local
+        });
+    }
+    local_info.epoch.set(local + 1);
+    LocalPinGuard
+}
+
+pub struct LocalPinGuard;
+
+impl LocalPinGuard {
+
+    pub fn defer<T>(&self, ptr: &Guarded<T>, order: Ordering) -> Option<&T> {
+        // FIXME: should we increment local epoch here?
+        unsafe { ptr.0.load(order).as_ref() }
+    }
+
+    // FIXME: provide a way to collect removed garbage
+
+}
+
+pub struct Guarded<T>(AtomicPtr<T>);
+
 struct ConcLinkedList<T> {
     root: AtomicPtr<ConcLinkedListNode<T>>,
-    iter_cnt: AtomicUsize,
+    flags: AtomicUsize,
     // len: AtomicUsize,
 }
 
 const DRAIN_FLAG: usize = 1 << (usize::BITS as usize - 1);
 
 impl<T> ConcLinkedList<T> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             root: AtomicPtr::new(null_mut()),
-            iter_cnt: AtomicUsize::new(0),
+            flags: AtomicUsize::new(0),
         }
     }
 
@@ -75,7 +121,7 @@ impl<T> ConcLinkedList<T> {
     }
 
     fn is_draining(&self) -> bool {
-        self.iter_cnt.load(std::sync::atomic::Ordering::Acquire) & DRAIN_FLAG != 0
+        self.flags.load(std::sync::atomic::Ordering::Acquire) & DRAIN_FLAG != 0
     }
 
     fn push_front(&self, val: T) {
@@ -103,7 +149,7 @@ impl<T> ConcLinkedList<T> {
     }
 
     fn try_drain<F: Fn(&T) -> bool>(&self, decision: F) -> bool {
-        match self.iter_cnt.compare_exchange(0, DRAIN_FLAG, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed) {
+        match self.flags.compare_exchange(0, DRAIN_FLAG, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed) {
             Ok(_) => {
                 let mut next = &self.root;
                 loop {
@@ -132,24 +178,13 @@ impl<T> ConcLinkedList<T> {
                         None => break,
                     }
                 }
-                self.iter_cnt.fetch_sub(DRAIN_FLAG, std::sync::atomic::Ordering::Release); // FIXME: can we make this a store by removing the iterator support?
+                self.flags.store(0, std::sync::atomic::Ordering::Release);
                 true
             },
+            // there is another drain operation in progress
             Err(_) => false,
         }
 
-    }
-
-    // FIXME: add drain!
-
-    #[inline]
-    fn iter(&self) -> ConcListIter<T> {
-        self.iter_cnt.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        // FIXME: check if removal is happening and wait if so
-        ConcListIter {
-            next_lookup: &self.root,
-            list: self,
-        }
     }
 }
 
@@ -157,28 +192,5 @@ impl<T> ConcLinkedList<T> {
 struct ConcLinkedListNode<T> {
     next: AtomicPtr<ConcLinkedListNode<T>>,
     val: T,
-}
-
-struct ConcListIter<'a, T> {
-    next_lookup: &'a AtomicPtr<ConcLinkedListNode<T>>,
-    list: &'a ConcLinkedList<T>,
-}
-
-impl<'a, T> Iterator for ConcListIter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = self.next_lookup.load(std::sync::atomic::Ordering::Acquire);
-        unsafe { next.as_ref() }.map(|node| {
-            self.next_lookup = &node.next;
-            &node.val
-        })
-    }
-}
-
-impl<'a, T> Drop for ConcListIter<'a, T> {
-    fn drop(&mut self) {
-        self.list.iter_cnt.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
 }
 
