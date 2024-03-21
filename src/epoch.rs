@@ -174,8 +174,8 @@ pub(crate) fn pin() -> LocalPinGuard {
     let local = local_info.epoch.get();
     if update_epoch > local {
         // update epoch
-        let new = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel);
-        local_info.epoch.set(new + 1);
+        let new = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        local_info.epoch.set(new);
 
         let local_pile = unsafe { &mut *local_info.pile.get() };
         let mut rem_nodes = 0;
@@ -199,6 +199,23 @@ pub(crate) fn retire<T>(val: *const T) {
     let local_ptr = local_ptr();
     unsafe {
         (&mut *(&*local_ptr).pile.get()).push(Instance::new(val, (&*local_ptr).epoch.get()));
+    }
+    let new_epoch = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    unsafe { &*local_ptr }.epoch.set(new_epoch);
+
+    let mut curr_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
+    loop {
+        match GLOBAL_INFO.update_epoch.compare_exchange(curr_epoch, new_epoch, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next_epoch) => {
+                if next_epoch > new_epoch {
+                    // fail as there was a more recent update than us
+                    break;
+                }
+                // retry setting our epoch
+                curr_epoch = next_epoch;
+            },
+        }
     }
 }
 
@@ -230,7 +247,8 @@ impl Drop for LocalPinGuard {
             return;
         }
 
-        // FIXME: handle non-local releases
+        // reduce shared count
+        unsafe { &*self.0 }.active_shared.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
