@@ -4,6 +4,4 @@
 
 mod epoch;
 
-fn main() {
-
-}
+fn main() {}

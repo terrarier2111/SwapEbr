@@ -1,9 +1,16 @@
 use std::{
-    alloc::{alloc, Layout}, cell::{Cell, SyncUnsafeCell}, process::abort, ptr::null_mut, sync::atomic::{AtomicPtr, AtomicUsize, Ordering}
+    alloc::{alloc, dealloc, Layout},
+    cell::{Cell, SyncUnsafeCell},
+    process::abort,
+    ptr::{self, null_mut},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+
+use self::conc_linked_list::ConcLinkedList;
 
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     pile: ConcLinkedList::new(),
+    locals_pile: ConcLinkedList::new(),
     epoch: AtomicUsize::new(1),
     update_epoch: AtomicUsize::new(0),
     threads: AtomicUsize::new(0),
@@ -11,6 +18,7 @@ static GLOBAL_INFO: GlobalInfo = GlobalInfo {
 
 struct GlobalInfo {
     pile: ConcLinkedList<Instance>,
+    locals_pile: ConcLinkedList<*const Inner>,
     epoch: AtomicUsize,
     update_epoch: AtomicUsize,
     threads: AtomicUsize,
@@ -39,15 +47,72 @@ struct LocalGuard;
 impl Drop for LocalGuard {
     fn drop(&mut self) {
         if let Some(local) = try_get_local() {
-            for garbage in unsafe { local.pile.get().as_ref().unwrap() } {} // FIXME: check on acquiring ptr instead!
+            let glob_epoch = GLOBAL_INFO.epoch.load(Ordering::Acquire);
+            let glob_threads = GLOBAL_INFO.threads.load(Ordering::Acquire);
+            for garbage in unsafe { local.pile.get().as_ref().unwrap() } {
+                if glob_epoch >= (garbage.epoch + glob_threads) {
+                    // release garbage as nobody looks at it anymore
+                    unsafe {
+                        garbage.cleanup();
+                    }
+                } else {
+                    // push garbage onto pile
+                    GLOBAL_INFO.pile.push_front(garbage.clone());
+                }
+            }
+            if local.active_shared.load(Ordering::Acquire)
+                == local.active_local.load(Ordering::Acquire)
+            {
+                // there are no more external references, so local can be cleaned up immediately
+                unsafe {
+                    ptr::drop_in_place(local as *const Inner as *mut Inner);
+                }
+                unsafe {
+                    dealloc(local as *const Inner as *mut u8, Layout::new::<Inner>());
+                }
+            } else {
+                // there are still external references alive, so delay cleanup until they die
+                GLOBAL_INFO.locals_pile.push_front(local as *const Inner);
+            }
+            GLOBAL_INFO.threads.fetch_sub(1, Ordering::Release);
         }
     }
 }
 
+#[repr(transparent)]
+struct DropWrapper<T>(T);
+
+impl<T> Drop for DropWrapper<T> {
+    fn drop(&mut self) {}
+}
+
+#[derive(Clone)]
 struct Instance {
-    drop_fn: fn(*mut ()),
+    drop_fn: Option<unsafe fn(*mut ())>,
     data_ptr: *const (),
     epoch: usize,
+}
+
+impl Instance {
+    fn new<T>(val: *const T, epoch: usize) -> Self {
+        Self {
+            drop_fn: if core::mem::needs_drop::<T>() {
+                let drop_fn = core::ptr::drop_in_place::<T> as *const ();
+                Some(unsafe { core::mem::transmute::<_, fn(*mut ())>(drop_fn) })
+            } else {
+                None
+            },
+            data_ptr: val.cast::<()>(),
+            epoch,
+        }
+    }
+
+    #[inline]
+    unsafe fn cleanup(&self) {
+        if let Some(drop_fn) = self.drop_fn {
+            drop_fn(self.data_ptr.cast_mut());
+        }
+    }
 }
 
 unsafe impl Send for Instance {}
@@ -68,7 +133,6 @@ fn get_local<'a>() -> &'a Inner {
     #[cold]
     #[inline(never)]
     fn alloc_local<'a>() -> &'a Inner {
-        
         let src = LOCAL_INFO.get();
         unsafe {
             let alloc = alloc(Layout::new::<Inner>()).cast::<Inner>();
@@ -126,11 +190,16 @@ pub(crate) fn pin() -> LocalPinGuard {
             local_pile.remove(0);
         }
         // try cleanup global
-        GLOBAL_INFO.pile.try_drain(|val| {
-            val.epoch == local
-        });
+        GLOBAL_INFO.pile.try_drain(|val| val.epoch == local);
     }
     LocalPinGuard(local_info as *const Inner)
+}
+
+pub(crate) fn retire<T>(val: *const T) {
+    let local_ptr = local_ptr();
+    unsafe {
+        (&mut *(&*local_ptr).pile.get()).push(Instance::new(val, (&*local_ptr).epoch.get()));
+    }
 }
 
 pub struct LocalPinGuard(*const Inner);
@@ -139,25 +208,25 @@ unsafe impl Sync for LocalPinGuard {}
 unsafe impl Send for LocalPinGuard {}
 
 impl LocalPinGuard {
-
     pub fn defer<T>(&self, ptr: &Guarded<T>, order: Ordering) -> Option<&T> {
         unsafe { ptr.0.load(order).as_ref() }
     }
 
     // FIXME: provide a way to collect removed garbage
-
 }
 
 impl Drop for LocalPinGuard {
     fn drop(&mut self) {
         // reduce local cnt safely even if src thread terminated
 
-
         let local_ptr = local_ptr();
         // fast path for thread local releases
         if self.0 == local_ptr {
             let local = unsafe { &*local_ptr };
-            local.active_local.store(local.active_local.load(Ordering::Relaxed), Ordering::Release);
+            local.active_local.store(
+                local.active_local.load(Ordering::Relaxed),
+                Ordering::Release,
+            );
             return;
         }
 
@@ -167,97 +236,177 @@ impl Drop for LocalPinGuard {
 
 pub struct Guarded<T>(AtomicPtr<T>);
 
-struct ConcLinkedList<T> {
-    root: AtomicPtr<ConcLinkedListNode<T>>,
-    flags: AtomicUsize,
-    // len: AtomicUsize,
-}
+mod conc_linked_list {
+    use std::{
+        ptr::null_mut,
+        sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    };
 
-const DRAIN_FLAG: usize = 1 << (usize::BITS as usize - 1);
+    pub(crate) struct ConcLinkedList<T> {
+        root: AtomicPtr<ConcLinkedListNode<T>>,
+        flags: AtomicUsize,
+        // len: AtomicUsize,
+    }
 
-impl<T> ConcLinkedList<T> {
-    const fn new() -> Self {
-        Self {
-            root: AtomicPtr::new(null_mut()),
-            flags: AtomicUsize::new(0),
+    const DRAIN_FLAG: usize = 1 << (usize::BITS as usize - 1);
+
+    impl<T> ConcLinkedList<T> {
+        pub(crate) const fn new() -> Self {
+            Self {
+                root: AtomicPtr::new(null_mut()),
+                flags: AtomicUsize::new(0),
+            }
         }
-    }
 
-    fn is_empty(&self) -> bool {
-        self.root.load(std::sync::atomic::Ordering::Acquire).is_null()
-    }
+        pub(crate) fn is_empty(&self) -> bool {
+            self.root.load(Ordering::Acquire).is_null()
+        }
 
-    fn is_draining(&self) -> bool {
-        self.flags.load(std::sync::atomic::Ordering::Acquire) & DRAIN_FLAG != 0
-    }
+        pub(crate) fn is_draining(&self) -> bool {
+            self.flags.load(Ordering::Acquire) & DRAIN_FLAG != 0
+        }
 
-    fn push_front(&self, val: T) {
-        let node = Box::into_raw(Box::new(ConcLinkedListNode {
-            next: AtomicPtr::new(null_mut()),
-            val,
-        }));
-        let mut curr = self.root.load(std::sync::atomic::Ordering::Acquire);
-        loop {
-            unsafe { node.as_ref().unwrap() }
-                .next
-                .store(curr, std::sync::atomic::Ordering::Release);
-            match self.root.compare_exchange(
-                curr,
-                node,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => {}
-                Err(new) => {
-                    curr = new;
+        pub(crate) fn push_front(&self, val: T) {
+            let node = Box::into_raw(Box::new(ConcLinkedListNode {
+                next: AtomicPtr::new(null_mut()),
+                val,
+            }));
+            let mut curr = self.root.load(Ordering::Acquire);
+            loop {
+                unsafe { node.as_ref().unwrap() }
+                    .next
+                    .store(curr, Ordering::Release);
+                match self
+                    .root
+                    .compare_exchange(curr, node, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => {}
+                    Err(new) => {
+                        curr = new;
+                    }
                 }
+            }
+        }
+
+        pub(crate) fn try_drain<F: Fn(&T) -> bool>(&self, decision: F) -> bool {
+            match self
+                .flags
+                .compare_exchange(0, DRAIN_FLAG, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    let mut next = &self.root;
+                    loop {
+                        let ptr = next.load(Ordering::Acquire);
+                        match unsafe { ptr.as_ref() } {
+                            Some(node) => {
+                                let rem = decision(&node.val);
+                                if rem {
+                                    let next_ptr = node.next.load(Ordering::Acquire);
+                                    match next.compare_exchange(
+                                        ptr,
+                                        next_ptr,
+                                        Ordering::AcqRel,
+                                        Ordering::Relaxed,
+                                    ) {
+                                        Ok(_) => break,
+                                        Err(mut node) => loop {
+                                            let new_next = unsafe { node.as_ref().unwrap() }
+                                                .next
+                                                .load(Ordering::Acquire);
+                                            if new_next == ptr {
+                                                unsafe { node.as_ref().unwrap() }
+                                                    .next
+                                                    .store(next_ptr, Ordering::Release);
+                                                break;
+                                            }
+                                            node = new_next;
+                                        },
+                                    }
+                                }
+                                next = &node.next;
+                            }
+                            None => break,
+                        }
+                    }
+                    self.flags.store(0, Ordering::Release);
+                    true
+                }
+                // there is another drain operation in progress
+                Err(_) => false,
             }
         }
     }
 
-    fn try_drain<F: Fn(&T) -> bool>(&self, decision: F) -> bool {
-        match self.flags.compare_exchange(0, DRAIN_FLAG, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed) {
-            Ok(_) => {
-                let mut next = &self.root;
-                loop {
-                    let ptr = next.load(std::sync::atomic::Ordering::Acquire);
-                    match unsafe { ptr.as_ref() } {
-                        Some(node) => {
-                            let rem = decision(&node.val);
-                            if rem {
-                                let next_ptr = node.next.load(std::sync::atomic::Ordering::Acquire);
-                                match next.compare_exchange(ptr, next_ptr, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed) {
-                                    Ok(_) => break,
-                                    Err(mut node) => {
-                                        loop {
-                                            let new_next = unsafe { node.as_ref().unwrap() }.next.load(std::sync::atomic::Ordering::Acquire);
-                                            if new_next == ptr {
-                                                &unsafe { node.as_ref().unwrap() }.next.store(next_ptr, std::sync::atomic::Ordering::Release);
-                                                break;
-                                            }
-                                            node = new_next;
-                                        }
-                                    },
-                                }
-                            }
-                            next = &node.next;
-                        },
-                        None => break,
-                    }
-                }
-                self.flags.store(0, std::sync::atomic::Ordering::Release);
-                true
-            },
-            // there is another drain operation in progress
-            Err(_) => false,
-        }
-
+    #[repr(align(4))]
+    struct ConcLinkedListNode<T> {
+        next: AtomicPtr<ConcLinkedListNode<T>>,
+        val: T,
     }
 }
 
-#[repr(align(4))]
-struct ConcLinkedListNode<T> {
-    next: AtomicPtr<ConcLinkedListNode<T>>,
-    val: T,
-}
+/*
+mod untyped_vec {
+    use std::{alloc::{alloc, realloc, Layout}, mem::{align_of, size_of}, process::abort, ptr::null_mut};
 
+    pub(crate) struct UntypedVec {
+        ptr: *mut usize,
+        cap: usize,
+        len: usize,
+        curr_idx: usize,
+    }
+
+    impl UntypedVec {
+
+        pub const fn new() -> Self {
+            Self {
+                ptr: null_mut(),
+                cap: 0,
+                len: 0,
+                curr_idx: 0,
+            }
+        }
+
+        #[inline]
+        pub const fn capacity(&self) -> usize {
+            self.cap
+        }
+
+        #[inline]
+        pub const fn len(&self) -> usize {
+            self.len
+        }
+
+        #[inline]
+        pub const fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        const INITIAL_CAP_MUL: usize = 8;
+        const CAP_MUL: usize = 2;
+
+        pub fn push<T>(&mut self, val: T) {
+            let remaining = self.cap - self.curr_idx;
+            let req = size_of::<T>().next_multiple_of(size_of::<usize>() + size_of::<usize>() + align_of::<T>() + size_of::<fn()>()) / size_of::<usize>();
+            if remaining < req {
+                if self.ptr.is_null() {
+                    let alloc = unsafe { alloc(Layout::from_size_align(req * Self::INITIAL_CAP_MUL, size_of::<usize>()).unwrap()) };
+                    if alloc.is_null() {
+                        abort();
+                    }
+                    self.ptr = alloc.cast::<usize>();
+                    self.cap = req * Self::INITIAL_CAP_MUL;
+                } else {
+                    // FIXME: should we try using realloc?
+                    let new_alloc = unsafe { alloc(Layout::array::<usize>(req).unwrap()) }.cast::<usize>();
+                    if new_alloc.is_null() {
+                        abort();
+                    }
+                    unsafe { core::ptr::copy_nonoverlapping(self.ptr, new_alloc, req); }
+                }
+            }
+            self.len += 1;
+            self.curr_idx +=
+        }
+
+    }
+}*/
