@@ -1,9 +1,5 @@
 use std::{
-    alloc::{alloc, dealloc, Layout},
-    cell::{Cell, SyncUnsafeCell},
-    process::abort,
-    ptr::{self, null_mut},
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    alloc::{alloc, dealloc, Layout}, cell::{Cell, SyncUnsafeCell}, mem::transmute, process::abort, ptr::{self, null_mut}, sync::atomic::{AtomicPtr, AtomicUsize, Ordering}
 };
 
 use self::conc_linked_list::ConcLinkedList;
@@ -72,29 +68,22 @@ impl Drop for LocalGuard {
     }
 }
 
-#[repr(transparent)]
-struct DropWrapper<T>(T);
-
-impl<T> Drop for DropWrapper<T> {
-    fn drop(&mut self) {}
-}
-
 #[derive(Clone)]
 struct Instance {
-    drop_fn: Option<unsafe fn(*mut ())>,
+    drop_fn: unsafe fn(*mut ()),
     data_ptr: *const (),
     epoch: usize,
 }
 
 impl Instance {
     fn new<T>(val: *const T, epoch: usize) -> Self {
+        let drop_fn = core::ptr::drop_in_place::<T>;
+        Self::new_explicit(val, epoch, drop_fn)
+    }
+
+    fn new_explicit<T>(val: *const T, epoch: usize, drop_fn: unsafe fn(*mut T)) -> Self {
         Self {
-            drop_fn: if core::mem::needs_drop::<T>() {
-                let drop_fn = core::ptr::drop_in_place::<T> as *const ();
-                Some(unsafe { core::mem::transmute::<_, fn(*mut ())>(drop_fn) })
-            } else {
-                None
-            },
+            drop_fn: unsafe { core::mem::transmute::<_, fn(*mut ())>(drop_fn) },
             data_ptr: val.cast::<()>(),
             epoch,
         }
@@ -102,9 +91,8 @@ impl Instance {
 
     #[inline]
     unsafe fn cleanup(&self) {
-        if let Some(drop_fn) = self.drop_fn {
-            drop_fn(self.data_ptr.cast_mut());
-        }
+        let drop_fn = self.drop_fn;
+        drop_fn(self.data_ptr.cast_mut());
     }
 }
 
@@ -158,8 +146,8 @@ pub(crate) fn pin() -> LocalPinGuard {
     let local_info = get_local();
     // this is relaxed as we know that we are the only thread currently to modify any local data
     let active = local_info.active_local.load(Ordering::Relaxed);
+    local_info.active_local.store(active + 1, Ordering::Release);
     if active != 0 {
-        local_info.active_local.store(active + 1, Ordering::Release);
         return LocalPinGuard(local_info as *const Inner);
     }
     let update_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
@@ -224,10 +212,10 @@ fn cleanup_local(local: *const Inner) {
     GLOBAL_INFO.threads.fetch_sub(1, Ordering::Release);
 }
 
-pub(crate) fn retire<T>(val: *const T) {
+pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     let local_ptr = local_ptr();
     unsafe {
-        (&mut *(&*local_ptr).pile.get()).push(Instance::new(val, (&*local_ptr).epoch.get()));
+        (&mut *(&*local_ptr).pile.get()).push(Instance::new_explicit(val, (&*local_ptr).epoch.get(), cleanup));
     }
     let new_epoch = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel) + 1;
     unsafe { &*local_ptr }.epoch.set(new_epoch);
@@ -248,17 +236,25 @@ pub(crate) fn retire<T>(val: *const T) {
     }
 }
 
+pub(crate) unsafe fn retire<T>(val: *const T) {
+    let drop_fn = ptr::drop_in_place::<T> as *const ();
+    let drop_fn = unsafe { transmute(drop_fn) };
+    retire_explicit(val, drop_fn);
+}
+
 pub struct LocalPinGuard(*const Inner);
 
 unsafe impl Sync for LocalPinGuard {}
 unsafe impl Send for LocalPinGuard {}
 
 impl LocalPinGuard {
-    pub fn defer<T>(&self, ptr: &Guarded<T>, order: Ordering) -> Option<&T> {
-        unsafe { ptr.0.load(order).as_ref() }
+    pub fn load<T>(&self, ptr: &Guarded<T>, order: Ordering) -> *const T {
+        ptr.0.load(order)
     }
 
-    // FIXME: provide a way to collect removed garbage
+    pub fn swap<T>(&self, ptr: &Guarded<T>, val: *const T, order: Ordering) -> *const T {
+        ptr.0.swap(val.cast_mut(), order)
+    }
 }
 
 impl Drop for LocalPinGuard {
@@ -282,6 +278,15 @@ impl Drop for LocalPinGuard {
 }
 
 pub struct Guarded<T>(AtomicPtr<T>);
+
+impl<T> Guarded<T> {
+
+    #[inline]
+    pub fn new(ptr: *mut T) -> Self {
+        Self(AtomicPtr::new(ptr))
+    }
+
+}
 
 mod conc_linked_list {
     use std::{
@@ -327,7 +332,7 @@ mod conc_linked_list {
                     .root
                     .compare_exchange(curr, node, Ordering::AcqRel, Ordering::Acquire)
                 {
-                    Ok(_) => {}
+                    Ok(_) => break,
                     Err(new) => {
                         curr = new;
                     }
