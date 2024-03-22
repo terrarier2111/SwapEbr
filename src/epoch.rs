@@ -36,7 +36,6 @@ struct Inner {
     epoch: Cell<usize>,
     active_local: AtomicUsize,
     active_shared: AtomicUsize,
-    tid: usize, // we use the ptr to this inner storage as our tid as it will only ever exist once and will only ever have the same (or no) owner as long as this Inner is allocated
 }
 
 unsafe impl Send for Inner {}
@@ -64,17 +63,11 @@ impl Drop for LocalGuard {
                 == local.active_local.load(Ordering::Acquire)
             {
                 // there are no more external references, so local can be cleaned up immediately
-                unsafe {
-                    ptr::drop_in_place(local as *const Inner as *mut Inner);
-                }
-                unsafe {
-                    dealloc(local as *const Inner as *mut u8, Layout::new::<Inner>());
-                }
+                cleanup_local(local);
             } else {
                 // there are still external references alive, so delay cleanup until they die
                 GLOBAL_INFO.locals_pile.push_front(local as *const Inner);
             }
-            GLOBAL_INFO.threads.fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -145,7 +138,6 @@ fn get_local<'a>() -> &'a Inner {
                 epoch: Cell::new(GLOBAL_INFO.epoch.load(Ordering::Acquire)),
                 active_local: AtomicUsize::new(0),
                 active_shared: AtomicUsize::new(0),
-                tid: src as usize,
             });
             *src = alloc;
             GLOBAL_INFO.threads.fetch_add(1, Ordering::Release);
@@ -173,26 +165,63 @@ pub(crate) fn pin() -> LocalPinGuard {
     let update_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
     let local = local_info.epoch.get();
     if update_epoch > local {
-        // update epoch
-        let new = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        local_info.epoch.set(new);
-
-        let local_pile = unsafe { &mut *local_info.pile.get() };
-        let mut rem_nodes = 0;
-        for item in local_pile.iter() {
-            if item.epoch == local {
-                rem_nodes += 1;
-            } else {
-                break;
-            }
-        }
-        for _ in 0..rem_nodes {
-            local_pile.remove(0);
-        }
-        // try cleanup global
-        GLOBAL_INFO.pile.try_drain(|val| val.epoch == local);
+        update_local(local_info);
     }
     LocalPinGuard(local_info as *const Inner)
+}
+
+#[cold]
+fn update_local(local_info: &Inner) {
+    let local = local_info.epoch.get();
+    // update epoch
+    let new = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    local_info.epoch.set(new);
+
+    let local_pile = unsafe { &mut *local_info.pile.get() };
+    let mut rem_nodes = 0;
+    for item in local_pile.iter() {
+        if item.epoch == local {
+            rem_nodes += 1;
+        } else {
+            break;
+        }
+    }
+    for _ in 0..rem_nodes {
+        local_pile.remove(0);
+    }
+    let threads = GLOBAL_INFO.threads.load(Ordering::Acquire); // FIXME: this can race with epoch, try putting both into one variable
+    // try cleanup global
+    GLOBAL_INFO.pile.try_drain(|val| {
+        // remove instance if distance between current epoch and instance's epoch is at least the number of threads
+        // FIXME: this condition seems faulty!
+        let remove = val.epoch + threads <= GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
+        if remove {
+            unsafe { val.cleanup(); }
+        }
+        remove
+    });
+    GLOBAL_INFO.locals_pile.try_drain(|local| {
+        let remove = unsafe { local.as_ref().unwrap_unchecked() }.epoch.get() + threads < new;
+        if remove {
+            cleanup_local(*local);
+        }
+        remove
+    });
+}
+
+fn cleanup_local(local: *const Inner) {
+    unsafe {
+        ptr::drop_in_place(local as *mut Inner);
+    }
+    unsafe {
+        dealloc(local as *const Inner as *mut u8, Layout::new::<Inner>());
+    }
+    // FIXME: there is a bug if a thread acknowledges the new epoch, increments the global counter and then terminates,
+    // FIXME: leading to the total number of threads to be decremented, an easy fix would be to increment the update_epoch leading to the dist between,
+    // but is that correct?
+    // FIXME: is incrementing update_epoch here the correct solution? - this probably is a solution but with unnecessary overhead, try improving this!
+    GLOBAL_INFO.update_epoch.fetch_add(1, Ordering::AcqRel);
+    GLOBAL_INFO.threads.fetch_sub(1, Ordering::Release);
 }
 
 pub(crate) fn retire<T>(val: *const T) {
@@ -241,7 +270,7 @@ impl Drop for LocalPinGuard {
         if self.0 == local_ptr {
             let local = unsafe { &*local_ptr };
             local.active_local.store(
-                local.active_local.load(Ordering::Relaxed),
+                local.active_local.load(Ordering::Relaxed) - 1,
                 Ordering::Release,
             );
             return;
