@@ -1,5 +1,10 @@
 use std::{
-    alloc::{alloc, dealloc, Layout}, cell::{Cell, SyncUnsafeCell}, mem::transmute, process::abort, ptr::{self, null_mut}, sync::atomic::{AtomicPtr, AtomicUsize, Ordering}
+    alloc::{alloc, dealloc, Layout},
+    cell::{Cell, SyncUnsafeCell},
+    mem::transmute,
+    process::abort,
+    ptr::{self, null_mut},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
 use self::conc_linked_list::ConcLinkedList;
@@ -178,13 +183,15 @@ fn update_local(local_info: &Inner) {
         local_pile.remove(0);
     }
     let threads = GLOBAL_INFO.threads.load(Ordering::Acquire); // FIXME: this can race with epoch, try putting both into one variable
-    // try cleanup global
+                                                               // try cleanup global
     GLOBAL_INFO.pile.try_drain(|val| {
         // remove instance if distance between current epoch and instance's epoch is at least the number of threads
         // FIXME: this condition seems faulty!
         let remove = val.epoch + threads <= GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
         if remove {
-            unsafe { val.cleanup(); }
+            unsafe {
+                val.cleanup();
+            }
         }
         remove
     });
@@ -215,14 +222,23 @@ fn cleanup_local(local: *const Inner) {
 pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     let local_ptr = local_ptr();
     unsafe {
-        (&mut *(&*local_ptr).pile.get()).push(Instance::new_explicit(val, (&*local_ptr).epoch.get(), cleanup));
+        (&mut *(&*local_ptr).pile.get()).push(Instance::new_explicit(
+            val,
+            (&*local_ptr).epoch.get(),
+            cleanup,
+        ));
     }
     let new_epoch = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel) + 1;
     unsafe { &*local_ptr }.epoch.set(new_epoch);
 
     let mut curr_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
     loop {
-        match GLOBAL_INFO.update_epoch.compare_exchange(curr_epoch, new_epoch, Ordering::AcqRel, Ordering::Relaxed) {
+        match GLOBAL_INFO.update_epoch.compare_exchange(
+            curr_epoch,
+            new_epoch,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => break,
             Err(next_epoch) => {
                 if next_epoch > new_epoch {
@@ -231,7 +247,7 @@ pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
                 }
                 // retry setting our epoch
                 curr_epoch = next_epoch;
-            },
+            }
         }
     }
 }
@@ -273,19 +289,19 @@ impl Drop for LocalPinGuard {
         }
 
         // reduce shared count
-        unsafe { &*self.0 }.active_shared.fetch_sub(1, Ordering::AcqRel);
+        unsafe { &*self.0 }
+            .active_shared
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 pub struct Guarded<T>(AtomicPtr<T>);
 
 impl<T> Guarded<T> {
-
     #[inline]
     pub fn new(ptr: *mut T) -> Self {
         Self(AtomicPtr::new(ptr))
     }
-
 }
 
 mod conc_linked_list {
@@ -462,3 +478,57 @@ mod untyped_vec {
 
     }
 }*/
+
+#[cfg(test)]
+mod test {
+    use std::{
+        mem::transmute,
+        sync::{atomic::Ordering, Arc},
+        thread,
+    };
+
+    use crate::epoch::{self, retire_explicit, Guarded};
+
+    #[test]
+    fn test_basic() {
+        unsafe fn cleanup_box<T>(ptr: *mut T) {
+            let _ = Box::from_raw(ptr);
+        }
+
+        let cleanup_fn = cleanup_box::<String> as *const ();
+        let cleanup_fn = unsafe { transmute(cleanup_fn) };
+
+        let initial = Box::new("test".to_string());
+        let guard = Arc::new(Guarded::new(Box::into_raw(initial)));
+        let pin = epoch::pin();
+        let pinned = pin.load(&guard, Ordering::Acquire);
+        println!("pinned: {}", unsafe { &*pinned });
+        let move_guard = guard.clone();
+        let other = thread::spawn(move || {
+            let guard = move_guard;
+            let pin = epoch::pin();
+            for i in 0..100 {
+                let i = 100 + i;
+                let curr = Box::new(format!("test{i}"));
+                let prev = pin.swap(&guard, Box::into_raw(curr), Ordering::AcqRel);
+                unsafe {
+                    retire_explicit(prev, cleanup_fn);
+                }
+            }
+            println!("finished2");
+        });
+        for i in 0..100 {
+            let curr = Box::new(format!("test{i}"));
+            let prev = pin.swap(&guard, Box::into_raw(curr), Ordering::AcqRel);
+            unsafe {
+                retire_explicit(prev, cleanup_fn);
+            }
+        }
+        println!("finished1");
+
+        other.join().unwrap();
+        unsafe {
+            retire_explicit(pin.load(&guard, Ordering::Acquire), cleanup_fn);
+        }
+    }
+}

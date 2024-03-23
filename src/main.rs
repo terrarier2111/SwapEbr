@@ -3,47 +3,100 @@
 #![feature(cell_update)]
 #![feature(vec_into_raw_parts)]
 
-use std::{mem::transmute, sync::{atomic::Ordering, Arc}, thread};
+use std::{ops::Deref, sync::atomic::Ordering};
 
-use epoch::Guarded;
-
-use crate::epoch::retire_explicit;
+use epoch::{pin, Guarded, LocalPinGuard};
 
 mod epoch;
 
 fn main() {
-    let cleanup_fn = cleanup_box::<String> as *const ();
-    let cleanup_fn = unsafe { transmute(cleanup_fn) };
-
-    let initial = Box::new("test".to_string());
-    let second = Box::new("test2".to_string());
-    let guard = Arc::new(Guarded::new(Box::into_raw(initial)));
-    let pin = epoch::pin();
-    let pinned = pin.load(&guard, Ordering::Acquire);
-    println!("pinned: {}", unsafe { &*pinned });
-    let move_guard = guard.clone();
-    let other = thread::spawn(move || {
-        let guard = move_guard;
-        let pin = epoch::pin();
-        for i in 0..100 {
-            let i = 100 + i;
-            let curr = Box::new(format!("test{i}"));
-            let prev = pin.swap(&guard, Box::into_raw(curr), Ordering::AcqRel);
-            unsafe { retire_explicit(prev, cleanup_fn);  }
-        }
-        println!("finished2");
-    });
-    for i in 0..100 {
-        let curr = Box::new(format!("test{i}"));
-        let prev = pin.swap(&guard, Box::into_raw(curr), Ordering::AcqRel);
-        unsafe { retire_explicit(prev, cleanup_fn);  }
-    }
-    println!("finished1");
-
-    other.join().unwrap();
-    unsafe { retire_explicit(pin.load(&guard, Ordering::Acquire), cleanup_fn); }
+    
 }
 
-unsafe fn cleanup_box<T>(ptr: *mut T) {
-    let _ = Box::from_raw(ptr);
+pub struct SwapIt<T> {
+    it: Guarded<T>,
+}
+
+impl<T> SwapIt<T> {
+    pub fn new(val: T) -> Self {
+        Self {
+            it: Guarded::new(Box::into_raw(Box::new(val))),
+        }
+    }
+
+    pub fn load(&self) -> Guard<T> {
+        let pin = pin();
+        Guard {
+            it: pin.load(&self.it, Ordering::Acquire),
+            _guard: pin,
+        }
+    }
+
+    pub fn store(&self, val: T) {
+        let ptr = Box::into_raw(Box::new(val));
+        let pin = pin();
+        let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
+        let _ = unsafe { Box::from_raw(old.cast_mut()) };
+    }
+}
+
+impl<T> Drop for SwapIt<T> {
+    fn drop(&mut self) {
+        let pin = pin();
+        let curr = pin.load(&self.it, Ordering::Acquire);
+        let _ = unsafe { Box::from_raw(curr.cast_mut()) };
+    }
+}
+
+pub struct Guard<T> {
+    _guard: LocalPinGuard,
+    it: *const T,
+}
+
+impl<T> Deref for Guard<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.it }
+    }
+}
+
+unsafe impl<T> Send for Guard<T> {}
+unsafe impl<T> Sync for Guard<T> {}
+
+#[cfg(all(test, miri))]
+mod test {
+    use std::sync::Arc;
+
+    use crate::SwapIt;
+
+
+    #[test]
+    fn test_load_multi_miri() {
+        use std::hint::black_box;
+        use std::thread;
+        let tmp = Arc::new(SwapIt::new(Arc::new(3)));
+        let mut threads = vec![];
+        for _ in 0..4 {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                for _ in 0..200 {
+                    let l1 = tmp.load();
+                    black_box(l1);
+                }
+            }));
+        }
+        for _ in 0..4 {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                for _ in 0..200 {
+                    tmp.store(Arc::new(rand::random()));
+                }
+            }));
+        }
+        threads
+            .into_iter()
+            .for_each(|thread| thread.join().unwrap());
+    }
 }
