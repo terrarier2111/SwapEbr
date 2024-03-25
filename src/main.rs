@@ -9,9 +9,7 @@ use epoch::{pin, Guarded, LocalPinGuard};
 
 mod epoch;
 
-fn main() {
-    
-}
+fn main() {}
 
 pub struct SwapIt<T> {
     it: Guarded<T>,
@@ -70,7 +68,6 @@ mod test {
     use std::sync::Arc;
 
     use crate::SwapIt;
-
 
     #[test]
     fn test_load_multi_miri() {

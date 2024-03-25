@@ -9,12 +9,16 @@ use std::{
 
 use self::conc_linked_list::ConcLinkedList;
 
+#[cfg(target_pointer_width = "64")]
+type UFourth = u16;
+#[cfg(target_pointer_width = "32")]
+type UFourth = u8;
+
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     pile: ConcLinkedList::new(),
     locals_pile: ConcLinkedList::new(),
     epoch: AtomicUsize::new(1),
     update_epoch: AtomicUsize::new(0),
-    threads: AtomicUsize::new(0),
 };
 
 struct GlobalInfo {
@@ -22,7 +26,6 @@ struct GlobalInfo {
     locals_pile: ConcLinkedList<*const Inner>,
     epoch: AtomicUsize,
     update_epoch: AtomicUsize,
-    threads: AtomicUsize,
 }
 
 #[thread_local]
@@ -47,8 +50,8 @@ struct LocalGuard;
 impl Drop for LocalGuard {
     fn drop(&mut self) {
         if let Some(local) = try_get_local() {
-            let glob_epoch = GLOBAL_INFO.epoch.load(Ordering::Acquire);
-            let glob_threads = GLOBAL_INFO.threads.load(Ordering::Acquire);
+            let glob_epoch = get_epoch();
+            let glob_threads = get_threads();
             for garbage in unsafe { local.pile.get().as_ref().unwrap() } {
                 if glob_epoch >= (garbage.epoch + glob_threads) {
                     // release garbage as nobody looks at it anymore
@@ -128,12 +131,12 @@ fn get_local<'a>() -> &'a Inner {
             }
             alloc.write(Inner {
                 pile: SyncUnsafeCell::new(vec![]),
-                epoch: Cell::new(GLOBAL_INFO.epoch.load(Ordering::Acquire)),
+                epoch: Cell::new(get_epoch()),
                 active_local: AtomicUsize::new(0),
                 active_shared: AtomicUsize::new(0),
             });
             *src = alloc;
-            GLOBAL_INFO.threads.fetch_add(1, Ordering::Release);
+            increment_threads();
             LOCAL_GUARD.with(|_| {});
             alloc.as_ref().unwrap_unchecked()
         }
@@ -163,12 +166,78 @@ pub(crate) fn pin() -> LocalPinGuard {
     LocalPinGuard(local_info as *const Inner)
 }
 
+const MAX_THREADS: usize = UFourth::MAX as usize;
+const THREADS_MASK: usize = MAX_THREADS;
+
+const EPOCH_MASK: usize = usize::MAX & !THREADS_MASK;
+
+// these two get combined into a single AtomicUsize in order to avoid race conditions
+struct EpochInfo {
+    epoch: usize,
+    threads: usize,
+}
+
+fn increment_epoch() -> EpochInfo {
+    const EPOCH_ONE: usize = MAX_THREADS + 1;
+    const EPOCH_WRAP_AROUND_GUARD: usize = (usize::MAX >> 2) & !THREADS_MASK;
+    const EPOCH_OVERFLOW_GUARD: usize = (usize::MAX >> 1) & !THREADS_MASK;
+
+    let mut new = GLOBAL_INFO.epoch.fetch_add(EPOCH_ONE, Ordering::AcqRel) + EPOCH_ONE;
+    if new >= EPOCH_OVERFLOW_GUARD {
+        panic!("Epoch guard was hit");
+    }
+    if new >= EPOCH_WRAP_AROUND_GUARD {
+        let mut curr = new;
+        loop {
+            match GLOBAL_INFO.epoch.compare_exchange(
+                curr,
+                curr - EPOCH_WRAP_AROUND_GUARD,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(new) => {
+                    if new < EPOCH_WRAP_AROUND_GUARD {
+                        break;
+                    }
+                    curr = new;
+                }
+            }
+        }
+        new -= EPOCH_WRAP_AROUND_GUARD;
+    }
+    EpochInfo {
+        epoch: new & EPOCH_MASK,
+        threads: new & THREADS_MASK,
+    }
+}
+
+fn get_epoch() -> usize {
+    GLOBAL_INFO.epoch.load(Ordering::Acquire) & EPOCH_MASK
+}
+
+fn get_threads() -> usize {
+    GLOBAL_INFO.epoch.load(Ordering::Acquire) & THREADS_MASK
+}
+
+fn decrement_threads() {
+    const THREAD_ONE: usize = 1;
+
+    GLOBAL_INFO.epoch.fetch_sub(THREAD_ONE, Ordering::AcqRel);
+}
+
+fn increment_threads() -> usize {
+    const THREAD_ONE: usize = 1;
+
+    (GLOBAL_INFO.epoch.fetch_add(THREAD_ONE, Ordering::AcqRel) + THREAD_ONE) & THREADS_MASK
+}
+
 #[cold]
 fn update_local(local_info: &Inner) {
     let local = local_info.epoch.get();
     // update epoch
-    let new = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-    local_info.epoch.set(new);
+    let new = increment_epoch();
+    local_info.epoch.set(new.epoch);
 
     let local_pile = unsafe { &mut *local_info.pile.get() };
     let mut rem_nodes = 0;
@@ -182,8 +251,8 @@ fn update_local(local_info: &Inner) {
     for _ in 0..rem_nodes {
         local_pile.remove(0);
     }
-    let threads = GLOBAL_INFO.threads.load(Ordering::Acquire); // FIXME: this can race with epoch, try putting both into one variable
-                                                               // try cleanup global
+    let threads = new.threads;
+    // try cleanup global
     GLOBAL_INFO.pile.try_drain(|val| {
         // remove instance if distance between current epoch and instance's epoch is at least the number of threads
         // FIXME: this condition seems faulty!
@@ -196,7 +265,7 @@ fn update_local(local_info: &Inner) {
         remove
     });
     GLOBAL_INFO.locals_pile.try_drain(|local| {
-        let remove = unsafe { local.as_ref().unwrap_unchecked() }.epoch.get() + threads < new;
+        let remove = unsafe { local.as_ref().unwrap_unchecked() }.epoch.get() + threads < new.epoch;
         if remove {
             cleanup_local(*local);
         }
@@ -216,7 +285,7 @@ fn cleanup_local(local: *const Inner) {
     // but is that correct?
     // FIXME: is incrementing update_epoch here the correct solution? - this probably is a solution but with unnecessary overhead, try improving this!
     GLOBAL_INFO.update_epoch.fetch_add(1, Ordering::AcqRel);
-    GLOBAL_INFO.threads.fetch_sub(1, Ordering::Release);
+    decrement_threads();
 }
 
 pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
@@ -228,7 +297,7 @@ pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
             cleanup,
         ));
     }
-    let new_epoch = GLOBAL_INFO.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    let new_epoch = increment_epoch().epoch;
     unsafe { &*local_ptr }.epoch.set(new_epoch);
 
     let mut curr_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
@@ -490,7 +559,7 @@ mod test {
     use crate::epoch::{self, retire_explicit, Guarded};
 
     #[test]
-    fn test_basic() {
+    fn load_multi() {
         unsafe fn cleanup_box<T>(ptr: *mut T) {
             let _ = Box::from_raw(ptr);
         }
