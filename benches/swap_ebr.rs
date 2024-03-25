@@ -13,7 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use swap_arc::SwapArc;
-use SwapEbr::SwapIt;
+use SwapEbr::SwapArc as SwapIt;
+
+// NOTE: AArc seems to leak memory so comparing against it is a bit dangerous and can quickly lead to crashes
 
 fn main() {
     let mut c = Criterion::default().configure_from_args();
@@ -50,7 +52,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_con/destruct", |b| {
+    /*c.bench_function("aarc_con/destruct", |b| {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
@@ -58,7 +60,7 @@ fn main() {
             }
             start.elapsed()
         });
-    });
+    });*/
 
     // ---
 
@@ -1658,7 +1660,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_update_multi", |b| {
+    /*c.bench_function("aarc_update_multi", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -1686,5 +1688,5 @@ fn main() {
             }
             diff
         });
-    });
+    });*/
 }

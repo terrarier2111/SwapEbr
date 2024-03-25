@@ -1,3 +1,4 @@
+use cfg_if::cfg_if;
 use core::{
     alloc::Layout,
     cell::{Cell, UnsafeCell},
@@ -5,16 +6,19 @@ use core::{
     ptr::{drop_in_place, null_mut},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
-#[cfg(not(feature = "no_std"))]
-use std::thread_local;
+use crossbeam_utils::CachePadded;
 
-#[cfg(feature = "no_std")]
-use alloc::{
-    alloc::{alloc, dealloc},
-    vec::Vec,
-};
-#[cfg(not(feature = "no_std"))]
-use std::alloc::{alloc, dealloc};
+cfg_if! {
+    if #[cfg(not(feature = "no_std"))] {
+        use std::thread_local;
+        use std::alloc::{alloc, dealloc};
+    } else {
+        use alloc::{
+            alloc::{alloc, dealloc},
+            vec::Vec,
+        };
+    }
+}
 
 use self::conc_linked_list::ConcLinkedList;
 
@@ -27,14 +31,14 @@ static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     pile: ConcLinkedList::new(),
     locals_pile: ConcLinkedList::new(),
     epoch: AtomicUsize::new(1),
-    update_epoch: AtomicUsize::new(0),
+    update_epoch: CachePadded::new(AtomicUsize::new(0)),
 };
 
 struct GlobalInfo {
     pile: ConcLinkedList<Instance>,
     locals_pile: ConcLinkedList<*const Inner>,
     epoch: AtomicUsize,
-    update_epoch: AtomicUsize,
+    update_epoch: CachePadded<AtomicUsize>,
 }
 
 #[thread_local]
@@ -243,6 +247,7 @@ fn increment_threads() -> usize {
 }
 
 #[cold]
+#[inline(never)]
 fn update_local(local_info: &Inner) {
     let local = local_info.epoch.get();
     // update epoch
@@ -353,6 +358,7 @@ impl LocalPinGuard {
 }
 
 impl Drop for LocalPinGuard {
+    #[inline]
     fn drop(&mut self) {
         // reduce local cnt safely even if src thread terminated
 

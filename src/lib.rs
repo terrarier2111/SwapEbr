@@ -7,60 +7,47 @@
     feature(core_intrinsics)
 )]
 
-#[cfg(feature = "no_std")]
-extern crate alloc;
+cfg_if! {
+    if #[cfg(not(feature = "no_std"))] {
+        use std::sync::Arc;
+    } else {
+        extern crate alloc;
+        use alloc::boxed::Box;
+        use alloc::sync::Arc;
+    }
+}
 
-use core::{ops::Deref, sync::atomic::Ordering};
-
-#[cfg(feature = "no_std")]
-use alloc::boxed::Box;
+use cfg_if::cfg_if;
+use core::{mem::ManuallyDrop, ops::Deref, sync::atomic::Ordering};
 use epoch::{pin, retire_explicit, Guarded, LocalPinGuard};
 
 mod epoch;
 
-pub struct SwapIt<T> {
+pub struct SwapBox<T> {
     it: Guarded<T>,
 }
 
-impl<T> SwapIt<T> {
-    /// We use this count evaluation to store the Some() option count
-    const OPTION_LAYERS: usize = {
-        const OPTION_NAME: &str = "core::option::Option<";
+impl<T> SwapBox<T> {
+    const OPTION_LAYERS: usize = option_layers::<T>();
 
-        let ty_name = core::any::type_name::<T>();
-        let mut curr_idx = 0;
-        let mut layers = 0;
-        'outer: loop {
-            let end = curr_idx + OPTION_NAME.len();
-            let mut curr = curr_idx;
-            while curr < end {
-                if ty_name.as_bytes()[curr] != OPTION_NAME.as_bytes()[curr - curr_idx] {
-                    break 'outer;
-                }
-                curr += 1;
-            }
-            curr_idx = end;
-            layers += 1;
-        }
-        layers
-    };
-
-    pub fn new(val: T) -> Self {
+    pub fn new(val: Box<T>) -> Self {
         Self {
-            it: Guarded::new(Box::into_raw(Box::new(val))),
+            it: Guarded::new(Box::into_raw(val)),
         }
     }
 
-    pub fn load(&self) -> Guard<T> {
+    pub fn load(&self) -> BoxGuard<T> {
         let pin = pin();
-        Guard {
-            it: pin.load(&self.it, Ordering::Acquire),
+        BoxGuard {
+            it: ManuallyDrop::new(unsafe {
+                Box::from_raw(pin.load(&self.it, Ordering::Acquire).cast_mut())
+            }),
             _guard: pin,
         }
     }
 
-    pub fn store(&self, val: T) {
-        let ptr = Box::into_raw(Box::new(val));
+    pub fn store(&self, val: Box<T>) {
+        let ptr = Box::into_raw(val);
         let pin = pin();
         let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
         unsafe {
@@ -69,7 +56,7 @@ impl<T> SwapIt<T> {
     }
 }
 
-impl<T> Drop for SwapIt<T> {
+impl<T> Drop for SwapBox<T> {
     fn drop(&mut self) {
         let pin = pin();
         let curr = pin.load(&self.it, Ordering::Acquire);
@@ -79,26 +66,134 @@ impl<T> Drop for SwapIt<T> {
     }
 }
 
+pub struct BoxGuard<T> {
+    _guard: LocalPinGuard,
+    it: ManuallyDrop<Box<T>>,
+}
+
+impl<T> Deref for BoxGuard<T> {
+    type Target = Box<T>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.it.deref()
+    }
+}
+
+unsafe impl<T> Send for BoxGuard<T> {}
+unsafe impl<T> Sync for BoxGuard<T> {}
+
+pub struct SwapArc<T> {
+    it: Guarded<T>,
+}
+
+impl<T> SwapArc<T> {
+    const OPTION_LAYERS: usize = option_layers::<T>();
+
+    pub fn new(val: Arc<T>) -> Self {
+        Self {
+            it: Guarded::new(Arc::into_raw(val).cast_mut()),
+        }
+    }
+
+    pub fn load(&self) -> ArcGuard<T> {
+        let pin = pin();
+        ArcGuard {
+            it: ManuallyDrop::new(unsafe {
+                Arc::from_raw(pin.load(&self.it, Ordering::Acquire).cast_mut())
+            }),
+            _guard: pin,
+        }
+    }
+
+    pub fn store(&self, val: Arc<T>) {
+        let ptr = Arc::into_raw(val);
+        let pin = pin();
+        let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
+        unsafe {
+            retire_explicit(old, cleanup_arc::<T>);
+        }
+    }
+}
+
+impl<T> Drop for SwapArc<T> {
+    fn drop(&mut self) {
+        let pin = pin();
+        let curr = pin.load(&self.it, Ordering::Acquire);
+        unsafe {
+            retire_explicit(curr, cleanup_arc::<T>);
+        }
+    }
+}
+
+pub struct ArcGuard<T> {
+    _guard: LocalPinGuard,
+    it: ManuallyDrop<Arc<T>>,
+}
+
+impl<T> Deref for ArcGuard<T> {
+    type Target = Arc<T>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.it.deref()
+    }
+}
+
+unsafe impl<T> Send for ArcGuard<T> {}
+unsafe impl<T> Sync for ArcGuard<T> {}
+
+pub struct SwapIt<T> {
+    bx: SwapBox<T>,
+}
+
+impl<T> SwapIt<T> {
+    const OPTION_LAYERS: usize = option_layers::<T>();
+
+    pub fn new(val: T) -> Self {
+        Self {
+            bx: SwapBox::new(Box::new(val)),
+        }
+    }
+
+    pub fn load(&self) -> BoxGuard<T> {
+        self.bx.load()
+    }
+
+    pub fn store(&self, val: T) {
+        self.bx.store(Box::new(val));
+    }
+}
+
 fn cleanup_box<T>(ptr: *mut T) {
     let _ = unsafe { Box::from_raw(ptr) };
 }
 
-pub struct Guard<T> {
-    _guard: LocalPinGuard,
-    it: *const T,
+fn cleanup_arc<T>(ptr: *mut T) {
+    let _ = unsafe { Arc::from_raw(ptr) };
 }
 
-impl<T> Deref for Guard<T> {
-    type Target = T;
+/// We use this count evaluation to store the Some() option count
+const fn option_layers<T>() -> usize {
+    const OPTION_NAME: &str = "core::option::Option<";
 
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.it }
+    let ty_name = core::any::type_name::<T>();
+    let mut curr_idx = 0;
+    let mut layers = 0;
+    'outer: loop {
+        let end = curr_idx + OPTION_NAME.len();
+        let mut curr = curr_idx;
+        while curr < end {
+            if ty_name.as_bytes()[curr] != OPTION_NAME.as_bytes()[curr - curr_idx] {
+                break 'outer;
+            }
+            curr += 1;
+        }
+        curr_idx = end;
+        layers += 1;
     }
+    layers
 }
-
-unsafe impl<T> Send for Guard<T> {}
-unsafe impl<T> Sync for Guard<T> {}
 
 #[cfg(all(test, miri))]
 mod test {

@@ -8,7 +8,9 @@ version = "0.1.0"
 dependencies = [
  "aarc",
  "arc-swap",
+ "cfg-if",
  "criterion",
+ "crossbeam-utils",
  "rand",
  "swap-arc",
 ]
