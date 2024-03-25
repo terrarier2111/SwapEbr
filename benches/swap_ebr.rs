@@ -1,7 +1,8 @@
 extern crate criterion;
 
-use aarc::AtomicArc;
 use aarc::Arc as AArc;
+use aarc::AtomicArc;
+use aarc::Snapshot;
 use arc_swap::ArcSwap;
 use criterion::Criterion;
 use rand::random;
@@ -17,7 +18,7 @@ use SwapEbr::SwapIt;
 fn main() {
     let mut c = Criterion::default().configure_from_args();
 
-    c.bench_function("single_single", |b| {
+    c.bench_function("swap_ebr_single_single", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -147,7 +148,7 @@ fn main() {
     });
 
     c.bench_function("aarc_single_single", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -161,7 +162,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = tmp.load(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                         }
                     }));
@@ -174,7 +175,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            tmp.store(Arc::new(random()), Ordering::Release);
+                            tmp.store(Some(&AArc::new(random())), Ordering::Release);
                         }
                     }));
                 }
@@ -191,7 +192,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("single_multi", |b| {
+    c.bench_function("swap_ebr_single_multi", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -345,7 +346,7 @@ fn main() {
     });
 
     c.bench_function("aarc_single_multi", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -359,11 +360,11 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = black_box(tmp.load(Ordering::Acquire));
-                            let l2 = black_box(tmp.load(Ordering::Acquire));
-                            let l3 = black_box(tmp.load(Ordering::Acquire));
-                            let l4 = black_box(tmp.load(Ordering::Acquire));
-                            let l5 = black_box(tmp.load(Ordering::Acquire));
+                            let l1 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
+                            let l2 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
+                            let l3 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
+                            let l4 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
+                            let l5 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
                             drop(black_box(l1));
                             drop(black_box(l2));
                             drop(black_box(l3));
@@ -380,7 +381,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            tmp.store(Arc::new(rand::random()), Ordering::Release);
+                            tmp.store(Some(&AArc::new(rand::random())), Ordering::Release);
                         }
                     }));
                 }
@@ -397,7 +398,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("multi_single", |b| {
+    c.bench_function("swap_ebr_multi_single", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -557,7 +558,7 @@ fn main() {
     });
 
     c.bench_function("aarc_multi_single", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -575,7 +576,7 @@ fn main() {
                         for _ in 0..20000
                         /*200*/
                         {
-                            let l1 = tmp.load(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                         }
                     }));
@@ -594,7 +595,7 @@ fn main() {
                         for _ in 0..20000
                         /*200*/
                         {
-                            tmp.store(Arc::new(rand::random()), Ordering::Release);
+                            tmp.store(Some(&AArc::new(rand::random())), Ordering::Release);
                         }
                     }));
                 }
@@ -611,7 +612,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("multi_multi", |b| {
+    c.bench_function("swap_ebr_multi_multi", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -795,7 +796,7 @@ fn main() {
     });
 
     c.bench_function("aarc_multi_multi", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -813,11 +814,11 @@ fn main() {
                         for _ in 0..20000
                         /*200*/
                         {
-                            let l1 = tmp.load(Ordering::Acquire);
-                            let l2 = tmp.load(Ordering::Acquire);
-                            let l3 = tmp.load(Ordering::Acquire);
-                            let l4 = tmp.load(Ordering::Acquire);
-                            let l5 = tmp.load(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l2 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l3 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l4 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l5 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                             black_box(l2);
                             black_box(l3);
@@ -840,7 +841,7 @@ fn main() {
                         for _ in 0..20000
                         /*200*/
                         {
-                            tmp.store(Arc::new(rand::random()), Ordering::Release);
+                            tmp.store(Some(&AArc::new(rand::random())), Ordering::Release);
                         }
                     }));
                 }
@@ -857,7 +858,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("read_heavy_single", |b| {
+    c.bench_function("swap_ebr_read_heavy_single", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -957,7 +958,7 @@ fn main() {
     });
 
     c.bench_function("aarc_read_heavy_single", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -973,7 +974,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = tmp.load(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                         }
                     }));
@@ -991,7 +992,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("read_light_single", |b| {
+    c.bench_function("swap_ebr_read_light_single", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -1085,7 +1086,7 @@ fn main() {
     });
 
     c.bench_function("aarc_read_light_single", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -1099,7 +1100,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = tmp.load(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                         }
                     }));
@@ -1117,7 +1118,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("read_light_multi", |b| {
+    c.bench_function("swap_ebr_read_light_multi", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -1211,7 +1212,7 @@ fn main() {
     });
 
     c.bench_function("aarc_read_light_multi", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -1225,7 +1226,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = tmp.load(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                         }
                     }));
@@ -1243,7 +1244,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("read_heavy_multi", |b| {
+    c.bench_function("swap_ebr_read_heavy_multi", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -1361,7 +1362,7 @@ fn main() {
     });
 
     c.bench_function("aarc_read_heavy_multi", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -1375,11 +1376,11 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = tmp.load(Ordering::Acquire);
-                            let l2 = tmp.load(Ordering::Acquire);
-                            let l3 = tmp.load(Ordering::Acquire);
-                            let l4 = tmp.load(Ordering::Acquire);
-                            let l5 = tmp.load(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l2 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l3 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l4 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l5 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                             black_box(l2);
                             black_box(l3);
@@ -1401,7 +1402,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("update_single", |b| {
+    c.bench_function("swap_ebr_update_single", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -1492,7 +1493,7 @@ fn main() {
     });
 
     c.bench_function("aarc_update_single", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -1506,7 +1507,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            tmp.store(Arc::new(random()), Ordering::Release);
+                            tmp.store(Some(&AArc::new(random())), Ordering::Release);
                         }
                     }));
                 }
@@ -1523,7 +1524,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("update_multi", |b| {
+    c.bench_function("swap_ebr_update_multi", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
@@ -1614,7 +1615,7 @@ fn main() {
     });
 
     c.bench_function("aarc_update_multi", |b| {
-        let tmp = Arc::new(AtomicArc::new(Some(AArc::new(0))));
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             let mut diff = Duration::default();
             for _ in 0..iters {
@@ -1628,7 +1629,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            tmp.store(Arc::new(random()), Ordering::Release);
+                            tmp.store(Some(&AArc::new(random())), Ordering::Release);
                         }
                     }));
                 }
