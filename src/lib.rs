@@ -1,7 +1,4 @@
-#![feature(sync_unsafe_cell)]
 #![feature(thread_local)]
-#![feature(cell_update)]
-#![feature(vec_into_raw_parts)]
 #![feature(const_type_name)]
 #![cfg_attr(
     feature = "no_std",

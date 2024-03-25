@@ -1,6 +1,6 @@
 use core::{
     alloc::Layout,
-    cell::{Cell, SyncUnsafeCell},
+    cell::{Cell, UnsafeCell},
     mem::transmute,
     ptr::{drop_in_place, null_mut},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
@@ -382,6 +382,25 @@ impl<T> Guarded<T> {
         Self(AtomicPtr::new(ptr))
     }
 }
+
+struct SyncUnsafeCell<T>(UnsafeCell<T>);
+
+impl<T> SyncUnsafeCell<T> {
+
+    #[inline(always)]
+    const fn new(val: T) -> Self {
+        Self(UnsafeCell::new(val))
+    }
+
+    #[inline(always)]
+    const fn get(&self) -> *mut T {
+        self.0.get()
+    }
+
+}
+
+unsafe impl<T> Send for SyncUnsafeCell<T> {}
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 
 mod conc_linked_list {
     use core::{
