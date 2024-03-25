@@ -9,8 +9,6 @@ use epoch::{pin, Guarded, LocalPinGuard};
 
 mod epoch;
 
-fn main() {}
-
 pub struct SwapIt<T> {
     it: Guarded<T>,
 }
