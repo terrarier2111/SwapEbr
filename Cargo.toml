@@ -11,13 +11,16 @@ no_std = []
 
 [dependencies]
 
-
 [dev-dependencies]
 rand = "0.8"
 arc-swap = "1.7"
 criterion = "0.5.1"
-swap-arc = "0.1.1"
+# swap-arc = "0.1.1"
+swap-arc = { git = "https://github.com/terrarier2111/SwapArc" }
 aarc = "0.1"
+
+[test-dependencies]
+rand = "0.8"
 
 [[bench]]
 name = "swap_ebr"

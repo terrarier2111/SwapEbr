@@ -14,7 +14,7 @@ use core::{ops::Deref, sync::atomic::Ordering};
 
 #[cfg(feature = "no_std")]
 use alloc::boxed::Box;
-use epoch::{pin, Guarded, LocalPinGuard};
+use epoch::{pin, retire_explicit, Guarded, LocalPinGuard};
 
 mod epoch;
 
@@ -23,7 +23,6 @@ pub struct SwapIt<T> {
 }
 
 impl<T> SwapIt<T> {
-
     /// We use this count evaluation to store the Some() option count
     const OPTION_LAYERS: usize = {
         const OPTION_NAME: &str = "core::option::Option<";
@@ -64,7 +63,9 @@ impl<T> SwapIt<T> {
         let ptr = Box::into_raw(Box::new(val));
         let pin = pin();
         let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
-        let _ = unsafe { Box::from_raw(old.cast_mut()) };
+        unsafe {
+            retire_explicit(old, cleanup_box::<T>);
+        }
     }
 }
 
@@ -72,8 +73,14 @@ impl<T> Drop for SwapIt<T> {
     fn drop(&mut self) {
         let pin = pin();
         let curr = pin.load(&self.it, Ordering::Acquire);
-        let _ = unsafe { Box::from_raw(curr.cast_mut()) };
+        unsafe {
+            retire_explicit(curr, cleanup_box::<T>);
+        }
     }
+}
+
+fn cleanup_box<T>(ptr: *mut T) {
+    let _ = unsafe { Box::from_raw(ptr) };
 }
 
 pub struct Guard<T> {
@@ -95,7 +102,10 @@ unsafe impl<T> Sync for Guard<T> {}
 
 #[cfg(all(test, miri))]
 mod test {
+    #[cfg(feature = "no_std")]
     use alloc::sync::Arc;
+    #[cfg(not(feature = "no_std"))]
+    use std::sync::Arc;
 
     use crate::SwapIt;
 

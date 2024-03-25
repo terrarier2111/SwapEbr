@@ -292,6 +292,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "523dc4f511e55ab87b694dc30d0f820d60906ef06413f93d4d7a1385599cc149"
 
 [[package]]
+name = "memoffset"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a634b1c61a95585bd15607c6ab0c4e5b226e695ff2800ba0cdccddf208c406c"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -530,8 +539,7 @@ dependencies = [
 [[package]]
 name = "swap-arc"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56706d45a27230f3497fa83f8fdc338b95c00f443a9717876d65b071df7735a2"
+source = "git+https://github.com/terrarier2111/SwapArc#3a1c7e39b73bba6a614ae10e61ab75a727c9492e"
 dependencies = [
  "cfg-if",
  "crossbeam-utils",
@@ -572,11 +580,12 @@ dependencies = [
 
 [[package]]
 name = "thread_local"
-version = "1.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b9ef9bad013ada3808854ceac7b46812a6465ba368859a37e2100283d2d719c"
+version = "1.1.7"
+source = "git+https://github.com/terrarier2111/thread_local-rs/#fd17302bccf5ead94e54f7f7b9c74d5ccca7b200"
 dependencies = [
  "cfg-if",
+ "crossbeam-utils",
+ "memoffset",
  "once_cell",
 ]
 

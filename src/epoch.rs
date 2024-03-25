@@ -386,7 +386,6 @@ impl<T> Guarded<T> {
 struct SyncUnsafeCell<T>(UnsafeCell<T>);
 
 impl<T> SyncUnsafeCell<T> {
-
     #[inline(always)]
     const fn new(val: T) -> Self {
         Self(UnsafeCell::new(val))
@@ -396,7 +395,6 @@ impl<T> SyncUnsafeCell<T> {
     const fn get(&self) -> *mut T {
         self.0.get()
     }
-
 }
 
 unsafe impl<T> Send for SyncUnsafeCell<T> {}
