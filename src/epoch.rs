@@ -1,11 +1,20 @@
-use std::{
-    alloc::{alloc, dealloc, Layout},
+use core::{
+    alloc::Layout,
     cell::{Cell, SyncUnsafeCell},
     mem::transmute,
-    process::abort,
-    ptr::{self, null_mut},
+    ptr::{drop_in_place, null_mut},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+#[cfg(not(feature = "no_std"))]
+use std::thread_local;
+
+#[cfg(feature = "no_std")]
+use alloc::{
+    alloc::{alloc, dealloc},
+    vec::Vec,
+};
+#[cfg(not(feature = "no_std"))]
+use std::alloc::{alloc, dealloc};
 
 use self::conc_linked_list::ConcLinkedList;
 
@@ -53,7 +62,7 @@ impl Drop for LocalGuard {
             let glob = get_epoch_info();
             let glob_epoch = glob.epoch;
             let glob_threads = glob.threads;
-            for garbage in unsafe { local.pile.get().as_ref().unwrap() } {
+            for garbage in unsafe { &*local.pile.get() } {
                 if glob_epoch >= (garbage.epoch + glob_threads) {
                     // release garbage as nobody looks at it anymore
                     unsafe {
@@ -131,7 +140,7 @@ fn get_local<'a>() -> &'a Inner {
                 abort();
             }
             alloc.write(Inner {
-                pile: SyncUnsafeCell::new(vec![]),
+                pile: SyncUnsafeCell::new(Vec::new()),
                 epoch: Cell::new(get_epoch_info().epoch),
                 active_local: AtomicUsize::new(0),
                 active_shared: AtomicUsize::new(0),
@@ -139,7 +148,7 @@ fn get_local<'a>() -> &'a Inner {
             *src = alloc;
             increment_threads();
             LOCAL_GUARD.with(|_| {});
-            alloc.as_ref().unwrap_unchecked()
+            &*alloc
         }
     }
 
@@ -276,7 +285,7 @@ fn update_local(local_info: &Inner) {
 
 fn cleanup_local(local: *const Inner) {
     unsafe {
-        ptr::drop_in_place(local as *mut Inner);
+        drop_in_place(local as *mut Inner);
     }
     unsafe {
         dealloc(local as *const Inner as *mut u8, Layout::new::<Inner>());
@@ -323,7 +332,7 @@ pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
 }
 
 pub(crate) unsafe fn retire<T>(val: *const T) {
-    let drop_fn = ptr::drop_in_place::<T> as *const ();
+    let drop_fn = drop_in_place::<T> as *const ();
     let drop_fn = unsafe { transmute(drop_fn) };
     retire_explicit(val, drop_fn);
 }
@@ -375,15 +384,17 @@ impl<T> Guarded<T> {
 }
 
 mod conc_linked_list {
-    use std::{
+    use core::{
         ptr::null_mut,
         sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     };
 
+    #[cfg(feature = "no_std")]
+    use alloc::boxed::Box;
+
     pub(crate) struct ConcLinkedList<T> {
         root: AtomicPtr<ConcLinkedListNode<T>>,
         flags: AtomicUsize,
-        // len: AtomicUsize,
     }
 
     const DRAIN_FLAG: usize = 1 << (usize::BITS as usize - 1);
@@ -551,11 +562,9 @@ mod untyped_vec {
 
 #[cfg(test)]
 mod test {
-    use std::{
-        mem::transmute,
-        sync::{atomic::Ordering, Arc},
-        thread,
-    };
+    use core::{mem::transmute, sync::atomic::Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     use crate::epoch::{self, retire_explicit, Guarded};
 
@@ -601,4 +610,18 @@ mod test {
             retire_explicit(pin.load(&guard, Ordering::Acquire), cleanup_fn);
         }
     }
+}
+
+#[cfg(not(feature = "no_std"))]
+fn abort() -> ! {
+    use std::process::abort;
+
+    abort()
+}
+
+#[cfg(feature = "no_std")]
+fn abort() -> ! {
+    use core::intrinsics::abort;
+
+    abort()
 }

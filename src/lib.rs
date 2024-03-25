@@ -2,9 +2,20 @@
 #![feature(thread_local)]
 #![feature(cell_update)]
 #![feature(vec_into_raw_parts)]
+#![cfg_attr(
+    feature = "no_std",
+    no_std,
+    allow(internal_features),
+    feature(core_intrinsics)
+)]
 
-use std::{ops::Deref, sync::atomic::Ordering};
+#[cfg(feature = "no_std")]
+extern crate alloc;
 
+use core::{ops::Deref, sync::atomic::Ordering};
+
+#[cfg(feature = "no_std")]
+use alloc::boxed::Box;
 use epoch::{pin, Guarded, LocalPinGuard};
 
 mod epoch;
@@ -63,13 +74,13 @@ unsafe impl<T> Sync for Guard<T> {}
 
 #[cfg(all(test, miri))]
 mod test {
-    use std::sync::Arc;
+    use alloc::sync::Arc;
 
     use crate::SwapIt;
 
     #[test]
     fn test_load_multi_miri() {
-        use std::hint::black_box;
+        use core::hint::black_box;
         use std::thread;
         let tmp = Arc::new(SwapIt::new(Arc::new(3)));
         let mut threads = vec![];

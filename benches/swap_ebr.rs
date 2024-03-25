@@ -1,7 +1,7 @@
 extern crate criterion;
 
-use aarc::Arc as AArc;
 use aarc::AtomicArc;
+use aarc::Arc as AArc;
 use arc_swap::ArcSwap;
 use criterion::Criterion;
 use rand::random;

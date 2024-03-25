@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# default = ["no_std"]
+no_std = []
+
 [dependencies]
 
 
@@ -16,5 +20,5 @@ swap-arc = "0.1.1"
 aarc = "0.1"
 
 [[bench]]
-name = "swap_arc"
+name = "swap_ebr"
 harness = false
