@@ -2,6 +2,7 @@
 #![feature(thread_local)]
 #![feature(cell_update)]
 #![feature(vec_into_raw_parts)]
+#![feature(const_type_name)]
 #![cfg_attr(
     feature = "no_std",
     no_std,
@@ -25,6 +26,29 @@ pub struct SwapIt<T> {
 }
 
 impl<T> SwapIt<T> {
+
+    /// We use this count evaluation to store the Some() option count
+    const OPTION_LAYERS: usize = {
+        const OPTION_NAME: &str = "core::option::Option<";
+
+        let ty_name = core::any::type_name::<T>();
+        let mut curr_idx = 0;
+        let mut layers = 0;
+        'outer: loop {
+            let end = curr_idx + OPTION_NAME.len();
+            let mut curr = curr_idx;
+            while curr < end {
+                if ty_name.as_bytes()[curr] != OPTION_NAME.as_bytes()[curr - curr_idx] {
+                    break 'outer;
+                }
+                curr += 1;
+            }
+            curr_idx = end;
+            layers += 1;
+        }
+        layers
+    };
+
     pub fn new(val: T) -> Self {
         Self {
             it: Guarded::new(Box::into_raw(Box::new(val))),
