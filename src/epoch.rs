@@ -50,8 +50,9 @@ struct LocalGuard;
 impl Drop for LocalGuard {
     fn drop(&mut self) {
         if let Some(local) = try_get_local() {
-            let glob_epoch = get_epoch();
-            let glob_threads = get_threads();
+            let glob = get_epoch_info();
+            let glob_epoch = glob.epoch;
+            let glob_threads = glob.threads;
             for garbage in unsafe { local.pile.get().as_ref().unwrap() } {
                 if glob_epoch >= (garbage.epoch + glob_threads) {
                     // release garbage as nobody looks at it anymore
@@ -131,7 +132,7 @@ fn get_local<'a>() -> &'a Inner {
             }
             alloc.write(Inner {
                 pile: SyncUnsafeCell::new(vec![]),
-                epoch: Cell::new(get_epoch()),
+                epoch: Cell::new(get_epoch_info().epoch),
                 active_local: AtomicUsize::new(0),
                 active_shared: AtomicUsize::new(0),
             });
@@ -212,12 +213,12 @@ fn increment_epoch() -> EpochInfo {
     }
 }
 
-fn get_epoch() -> usize {
-    GLOBAL_INFO.epoch.load(Ordering::Acquire) & EPOCH_MASK
-}
-
-fn get_threads() -> usize {
-    GLOBAL_INFO.epoch.load(Ordering::Acquire) & THREADS_MASK
+fn get_epoch_info() -> EpochInfo {
+    let curr = GLOBAL_INFO.epoch.load(Ordering::Acquire);
+    EpochInfo {
+        epoch: curr & EPOCH_MASK,
+        threads: curr & THREADS_MASK,
+    }
 }
 
 fn decrement_threads() {
