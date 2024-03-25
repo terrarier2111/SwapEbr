@@ -18,6 +18,50 @@ use SwapEbr::SwapIt;
 fn main() {
     let mut c = Criterion::default().configure_from_args();
 
+    // ---
+
+    c.bench_function("swap_ebr_con/destruct", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = black_box(SwapIt::new(Arc::new(5)));
+            }
+            start.elapsed()
+        });
+    });
+
+    c.bench_function("swap_arc_con/destruct", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = black_box(SwapArc::new(Arc::new(5)));
+            }
+            start.elapsed()
+        });
+    });
+
+    c.bench_function("arc_swap_con/destruct", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = black_box(ArcSwap::new(Arc::new(5)));
+            }
+            start.elapsed()
+        });
+    });
+
+    c.bench_function("aarc_con/destruct", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = black_box(AtomicArc::new(Some(5)));
+            }
+            start.elapsed()
+        });
+    });
+
+    // ---
+
     c.bench_function("swap_ebr_single_single", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
