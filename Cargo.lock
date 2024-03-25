@@ -6,11 +6,18 @@ version = 3
 name = "SwapEbr"
 version = "0.1.0"
 dependencies = [
+ "aarc",
  "arc-swap",
  "criterion",
  "rand",
  "swap-arc",
 ]
+
+[[package]]
+name = "aarc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cab962a05288cba482154c7660e9b0543b785a451828e81ed774957848ed9c6"
 
 [[package]]
 name = "aho-corasick"

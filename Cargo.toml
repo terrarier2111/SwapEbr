@@ -13,6 +13,7 @@ rand = "0.8"
 arc-swap = "1.7"
 criterion = "0.5.1"
 swap-arc = "0.1.1"
+aarc = "0.1"
 
 [[bench]]
 name = "swap_arc"
