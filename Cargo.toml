@@ -10,7 +10,7 @@ edition = "2021"
 
 [dev-dependencies]
 rand = "0.8"
-arc-swap = "1.5.1"
+arc-swap = "1.7"
 criterion = "0.5.1"
 swap-arc = "0.1.1"
 
