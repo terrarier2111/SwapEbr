@@ -7,6 +7,7 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 use crossbeam_utils::CachePadded;
+use likely_stable::unlikely;
 
 cfg_if! {
     if #[cfg(not(feature = "no_std"))] {
@@ -132,6 +133,7 @@ fn try_get_local<'a>() -> Option<&'a Inner> {
     unsafe { local_ptr().as_ref() }
 }
 
+#[inline]
 fn get_local<'a>() -> &'a Inner {
     #[cold]
     #[inline(never)]
@@ -164,6 +166,8 @@ fn get_local<'a>() -> &'a Inner {
 }
 
 /// This may not be called if there is already a pin active
+#[inline(never)]
+#[no_mangle]
 pub(crate) fn pin() -> LocalPinGuard {
     let local_info = get_local();
     // this is relaxed as we know that we are the only thread currently to modify any local data
@@ -192,34 +196,44 @@ struct EpochInfo {
 }
 
 fn increment_epoch() -> EpochInfo {
+    #[cold]
+    #[inline(never)]
+    fn handle_guard_hit(epoch: &mut usize) {
+        if *epoch >= EPOCH_OVERFLOW_GUARD {
+            abort();
+        }
+        if *epoch >= EPOCH_WRAP_AROUND_GUARD {
+            let mut curr = *epoch;
+            loop {
+                match GLOBAL_INFO.epoch.compare_exchange(
+                    curr,
+                    curr - EPOCH_WRAP_AROUND_GUARD,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(new) => {
+                        if new < EPOCH_WRAP_AROUND_GUARD {
+                            break;
+                        }
+                        curr = new;
+                    }
+                }
+            }
+            *epoch -= EPOCH_WRAP_AROUND_GUARD;
+        }
+    }
+
     const EPOCH_ONE: usize = MAX_THREADS + 1;
     const EPOCH_WRAP_AROUND_GUARD: usize = (usize::MAX >> 2) & !THREADS_MASK;
     const EPOCH_OVERFLOW_GUARD: usize = (usize::MAX >> 1) & !THREADS_MASK;
 
     let mut new = GLOBAL_INFO.epoch.fetch_add(EPOCH_ONE, Ordering::AcqRel) + EPOCH_ONE;
-    if new >= EPOCH_OVERFLOW_GUARD {
-        panic!("Epoch guard was hit");
+
+    if unlikely(new >= EPOCH_WRAP_AROUND_GUARD) {
+        handle_guard_hit(&mut new);
     }
-    if new >= EPOCH_WRAP_AROUND_GUARD {
-        let mut curr = new;
-        loop {
-            match GLOBAL_INFO.epoch.compare_exchange(
-                curr,
-                curr - EPOCH_WRAP_AROUND_GUARD,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(new) => {
-                    if new < EPOCH_WRAP_AROUND_GUARD {
-                        break;
-                    }
-                    curr = new;
-                }
-            }
-        }
-        new -= EPOCH_WRAP_AROUND_GUARD;
-    }
+
     EpochInfo {
         epoch: new & EPOCH_MASK,
         threads: new & THREADS_MASK,
@@ -249,7 +263,6 @@ fn increment_threads() -> usize {
 #[cold]
 #[inline(never)]
 fn update_local(local_info: &Inner) {
-    let local = local_info.epoch.get();
     // update epoch
     let new = increment_epoch();
     local_info.epoch.set(new.epoch);
@@ -257,14 +270,29 @@ fn update_local(local_info: &Inner) {
     let local_pile = unsafe { &mut *local_info.pile.get() };
     let mut rem_nodes = 0;
     for item in local_pile.iter() {
-        if item.epoch == local {
+        // FIXME: the condition below will race with decrements of thread_count, maybe we can inline the  into
+        if item.epoch + new.threads < new.epoch {
             rem_nodes += 1;
+            unsafe {
+                item.cleanup();
+            }
         } else {
             break;
         }
     }
-    for _ in 0..rem_nodes {
-        local_pile.remove(0);
+    unsafe {
+        core::ptr::copy(
+            local_pile.as_mut_ptr().add(rem_nodes),
+            local_pile.as_mut_ptr(),
+            local_pile.len() - rem_nodes,
+        );
+    }
+    unsafe {
+        local_pile.set_len(local_pile.len() - rem_nodes);
+    }
+    // try resizing if necessary
+    if local_pile.len() * 3 < local_pile.capacity() {
+        local_pile.shrink_to(local_pile.capacity() / 2);
     }
     let threads = new.threads;
     // try cleanup global
@@ -299,10 +327,13 @@ fn cleanup_local(local: *const Inner) {
     // FIXME: leading to the total number of threads to be decremented, an easy fix would be to increment the update_epoch leading to the dist between,
     // but is that correct?
     // FIXME: is incrementing update_epoch here the correct solution? - this probably is a solution but with unnecessary overhead, try improving this!
+
+    // FIXME: this bug still isn't resolved tho as in case of local updates
     GLOBAL_INFO.update_epoch.fetch_add(1, Ordering::AcqRel);
     decrement_threads();
 }
 
+#[inline(never)]
 pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     let local_ptr = local_ptr();
     unsafe {
@@ -636,6 +667,7 @@ mod test {
 }
 
 #[cfg(not(feature = "no_std"))]
+#[inline]
 fn abort() -> ! {
     use std::process::abort;
 
@@ -643,6 +675,7 @@ fn abort() -> ! {
 }
 
 #[cfg(feature = "no_std")]
+#[inline]
 fn abort() -> ! {
     use core::intrinsics::abort;
 
