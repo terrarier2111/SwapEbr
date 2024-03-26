@@ -39,9 +39,7 @@ impl<T> SwapBox<T> {
     pub fn load(&self) -> BoxGuard<T> {
         let pin = pin();
         BoxGuard {
-            it: ManuallyDrop::new(unsafe {
-                Box::from_raw(pin.load(&self.it, Ordering::Acquire).cast_mut())
-            }),
+            it: pin.load(&self.it, Ordering::Acquire),
             _guard: pin,
         }
     }
@@ -68,15 +66,15 @@ impl<T> Drop for SwapBox<T> {
 
 pub struct BoxGuard<T> {
     _guard: LocalPinGuard,
-    it: ManuallyDrop<Box<T>>,
+    it: *const T,
 }
 
 impl<T> Deref for BoxGuard<T> {
-    type Target = Box<T>;
+    type Target = T;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.it.deref()
+        unsafe { &*self.it }
     }
 }
 
@@ -202,11 +200,38 @@ mod test {
     #[cfg(not(feature = "no_std"))]
     use std::sync::Arc;
 
+    use core::hint::black_box;
+
     use crate::SwapIt;
 
     #[test]
+    fn test_new_miri() {
+        black_box(SwapIt::new(Arc::new(3)));
+    }
+
+    #[test]
+    fn test_load_miri() {
+        let swap_it = black_box(SwapIt::new(Arc::new(3)));
+        black_box(swap_it.load());
+    }
+
+    #[test]
+    fn test_store_miri() {
+        let swap_it = black_box(SwapIt::new(Arc::new(3)));
+        swap_it.store(Arc::new(6));
+        black_box(swap_it);
+    }
+
+    #[test]
+    fn test_load_store_miri() {
+        let swap_it = black_box(SwapIt::new(Arc::new(3)));
+        let load = black_box(swap_it.load());
+        swap_it.store(Arc::new(6));
+        black_box(swap_it);
+    }
+
+    #[test]
     fn test_load_multi_miri() {
-        use core::hint::black_box;
         use std::thread;
         let tmp = Arc::new(SwapIt::new(Arc::new(3)));
         let mut threads = vec![];

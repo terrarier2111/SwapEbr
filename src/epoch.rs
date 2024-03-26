@@ -30,16 +30,16 @@ type UFourth = u8;
 
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     pile: ConcLinkedList::new(),
-    locals_pile: ConcLinkedList::new(),
-    epoch: AtomicUsize::new(1),
+    locals: ConcLinkedList::new(),
     update_epoch: CachePadded::new(AtomicUsize::new(0)),
+    min_safe_epoch: AtomicUsize::new(0),
 };
 
 struct GlobalInfo {
     pile: ConcLinkedList<Instance>,
-    locals_pile: ConcLinkedList<*const Inner>,
-    epoch: AtomicUsize,
+    locals: ConcLinkedList<*const Inner>, // FIXME: cache reusable locals
     update_epoch: CachePadded<AtomicUsize>,
+    min_safe_epoch: AtomicUsize,
 }
 
 #[thread_local]
@@ -51,8 +51,8 @@ thread_local! {
 
 struct Inner {
     pile: SyncUnsafeCell<Vec<Instance>>,
-    epoch: Cell<usize>,
-    active_local: AtomicUsize,
+    epoch: AtomicUsize,
+    active_local: AtomicUsize, // the MSB, if set indicates that this Inner is safe to remove
     active_shared: AtomicUsize,
 }
 
@@ -64,11 +64,8 @@ struct LocalGuard;
 impl Drop for LocalGuard {
     fn drop(&mut self) {
         if let Some(local) = try_get_local() {
-            let glob = get_epoch_info();
-            let glob_epoch = glob.epoch;
-            let glob_threads = glob.threads;
             for garbage in unsafe { &*local.pile.get() } {
-                if glob_epoch >= (garbage.epoch + glob_threads) {
+                if garbage.epoch < GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire) {
                     // release garbage as nobody looks at it anymore
                     unsafe {
                         garbage.cleanup();
@@ -82,10 +79,19 @@ impl Drop for LocalGuard {
                 == local.active_local.load(Ordering::Acquire)
             {
                 // there are no more external references, so local can be cleaned up immediately
-                cleanup_local(local);
+                // FIXME: don't iterate the whole list but only check a single entry (and store said entry in the local itself)
+                if GLOBAL_INFO.locals.try_drain(|curr| *curr == local) {
+                    cleanup_local(local);
+                } else {
+                    // set the indicator to ensure others can destroy this local
+                    local.epoch.store(
+                        local.epoch.load(Ordering::Acquire) | LOCAL_DESTROYED,
+                        Ordering::Release,
+                    );
+                }
             } else {
-                // there are still external references alive, so delay cleanup until they die
-                GLOBAL_INFO.locals_pile.push_front(local as *const Inner);
+                // NOTE: at this point we know that there must be external references
+                // to data retrieves through this guard remaining
             }
         }
     }
@@ -147,12 +153,12 @@ fn get_local<'a>() -> &'a Inner {
             }
             alloc.write(Inner {
                 pile: SyncUnsafeCell::new(Vec::new()),
-                epoch: Cell::new(get_epoch_info().epoch),
+                epoch: AtomicUsize::new(GLOBAL_INFO.update_epoch.load(Ordering::Acquire)),
                 active_local: AtomicUsize::new(0),
                 active_shared: AtomicUsize::new(0),
             });
             *src = alloc;
-            increment_threads();
+            GLOBAL_INFO.locals.push_front(alloc);
             LOCAL_GUARD.with(|_| {});
             &*alloc
         }
@@ -171,31 +177,24 @@ fn get_local<'a>() -> &'a Inner {
 pub(crate) fn pin() -> LocalPinGuard {
     let local_info = get_local();
     // this is relaxed as we know that we are the only thread currently to modify any local data
-    let active = local_info.active_local.load(Ordering::Relaxed);
+    let active = local_info
+        .active_local
+        .load(Ordering::Acquire /*Ordering::Relaxed*/);
     local_info.active_local.store(active + 1, Ordering::Release);
     if active != 0 {
         return LocalPinGuard(local_info as *const Inner);
     }
     let update_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
-    let local = local_info.epoch.get();
+    let local = local_info
+        .epoch
+        .load(Ordering::Acquire /*Ordering::Relaxed*/);
     if update_epoch > local {
         update_local(local_info);
     }
     LocalPinGuard(local_info as *const Inner)
 }
 
-const MAX_THREADS: usize = UFourth::MAX as usize;
-const THREADS_MASK: usize = MAX_THREADS;
-
-const EPOCH_MASK: usize = usize::MAX & !THREADS_MASK;
-
-// these two get combined into a single AtomicUsize in order to avoid race conditions
-struct EpochInfo {
-    epoch: usize,
-    threads: usize,
-}
-
-fn increment_epoch() -> EpochInfo {
+fn increment_update_epoch() -> usize {
     #[cold]
     #[inline(never)]
     fn handle_guard_hit(epoch: &mut usize) {
@@ -205,7 +204,7 @@ fn increment_epoch() -> EpochInfo {
         if *epoch >= EPOCH_WRAP_AROUND_GUARD {
             let mut curr = *epoch;
             loop {
-                match GLOBAL_INFO.epoch.compare_exchange(
+                match GLOBAL_INFO.update_epoch.compare_exchange(
                     curr,
                     curr - EPOCH_WRAP_AROUND_GUARD,
                     Ordering::AcqRel,
@@ -224,54 +223,35 @@ fn increment_epoch() -> EpochInfo {
         }
     }
 
-    const EPOCH_ONE: usize = MAX_THREADS + 1;
-    const EPOCH_WRAP_AROUND_GUARD: usize = (usize::MAX >> 2) & !THREADS_MASK;
-    const EPOCH_OVERFLOW_GUARD: usize = (usize::MAX >> 1) & !THREADS_MASK;
+    const EPOCH_ONE: usize = 1;
+    const EPOCH_WRAP_AROUND_GUARD: usize = usize::MAX >> 2;
+    const EPOCH_OVERFLOW_GUARD: usize = usize::MAX >> 1;
 
-    let mut new = GLOBAL_INFO.epoch.fetch_add(EPOCH_ONE, Ordering::AcqRel) + EPOCH_ONE;
+    let mut new = GLOBAL_INFO
+        .update_epoch
+        .fetch_add(EPOCH_ONE, Ordering::AcqRel)
+        + EPOCH_ONE;
 
     if unlikely(new >= EPOCH_WRAP_AROUND_GUARD) {
         handle_guard_hit(&mut new);
     }
 
-    EpochInfo {
-        epoch: new & EPOCH_MASK,
-        threads: new & THREADS_MASK,
-    }
-}
-
-fn get_epoch_info() -> EpochInfo {
-    let curr = GLOBAL_INFO.epoch.load(Ordering::Acquire);
-    EpochInfo {
-        epoch: curr & EPOCH_MASK,
-        threads: curr & THREADS_MASK,
-    }
-}
-
-fn decrement_threads() {
-    const THREAD_ONE: usize = 1;
-
-    GLOBAL_INFO.epoch.fetch_sub(THREAD_ONE, Ordering::AcqRel);
-}
-
-fn increment_threads() -> usize {
-    const THREAD_ONE: usize = 1;
-
-    (GLOBAL_INFO.epoch.fetch_add(THREAD_ONE, Ordering::AcqRel) + THREAD_ONE) & THREADS_MASK
+    new
 }
 
 #[cold]
 #[inline(never)]
 fn update_local(local_info: &Inner) {
     // update epoch
-    let new = increment_epoch();
-    local_info.epoch.set(new.epoch);
+    let new = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
+    local_info.epoch.store(new, Ordering::Release);
+
+    let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
 
     let local_pile = unsafe { &mut *local_info.pile.get() };
     let mut rem_nodes = 0;
     for item in local_pile.iter() {
-        // FIXME: the condition below will race with decrements of thread_count, maybe we can inline the  into
-        if item.epoch + new.threads < new.epoch {
+        if item.epoch < min_safe {
             rem_nodes += 1;
             unsafe {
                 item.cleanup();
@@ -294,12 +274,9 @@ fn update_local(local_info: &Inner) {
     if local_pile.len() * 3 < local_pile.capacity() {
         local_pile.shrink_to(local_pile.capacity() / 2);
     }
-    let threads = new.threads;
     // try cleanup global
     GLOBAL_INFO.pile.try_drain(|val| {
-        // remove instance if distance between current epoch and instance's epoch is at least the number of threads
-        // FIXME: this condition seems faulty!
-        let remove = val.epoch + threads <= GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
+        let remove = val.epoch < min_safe;
         if remove {
             unsafe {
                 val.cleanup();
@@ -307,14 +284,64 @@ fn update_local(local_info: &Inner) {
         }
         remove
     });
-    GLOBAL_INFO.locals_pile.try_drain(|local| {
-        let remove = unsafe { local.as_ref().unwrap_unchecked() }.epoch.get() + threads < new.epoch;
-        if remove {
+    if min_safe == new {
+        // don't try to update min_safe if it is already up-to-date
+        return;
+    }
+    let mut min_used = usize::MAX;
+    GLOBAL_INFO.locals.try_drain(|local| {
+        let local_epoch = unsafe { local.as_ref().unwrap_unchecked() }
+            .epoch
+            .load(Ordering::Acquire);
+        if local_epoch & LOCAL_DESTROYED != 0 {
             cleanup_local(*local);
+            return true;
         }
-        remove
+        // at this point we know that the local is either still in use locally or should be cleaned up by its remaining remote users
+        let outdated = local_epoch < new;
+        if outdated {
+            // the order in which these two loads happen in the comparison is very important!
+            // we first load active_shared as it may only ever grow and never shrink and then active_local which may both grow and shrink (but never below active_shared)
+            // this means that after loading active_shared even is active_local gets decremented as much as it can it could only ever lead to either matching
+            // the active_shared we observed (=> not in use) or being larger than active the active shared we observed (=> in use) which would only delay
+            // us cleaning up the garbage which is okay
+            // TODO: is this okay performance-wise (for the cache) or should we instead add a flag into the epoch variable and check that?
+            let in_use = unsafe { &**local }.active_shared.load(Ordering::Acquire)
+                != unsafe { &**local }.active_local.load(Ordering::Acquire);
+            if in_use && local_epoch < min_used {
+                min_used = local_epoch;
+            }
+        }
+        false
     });
+    let min_used = if min_used == usize::MAX {
+        new
+    } else {
+        min_used
+    };
+    if min_used > min_safe {
+        let mut curr_safe = min_safe;
+        loop {
+            match GLOBAL_INFO.min_safe_epoch.compare_exchange(
+                curr_safe,
+                min_used,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(new_safe) => {
+                    // check if the new safe value is more recent than our calculated value
+                    if new_safe >= min_used {
+                        break;
+                    }
+                    curr_safe = new_safe;
+                }
+            }
+        }
+    }
 }
+
+const LOCAL_DESTROYED: usize = 1 << (usize::BITS - 1);
 
 fn cleanup_local(local: *const Inner) {
     unsafe {
@@ -323,14 +350,6 @@ fn cleanup_local(local: *const Inner) {
     unsafe {
         dealloc(local as *const Inner as *mut u8, Layout::new::<Inner>());
     }
-    // FIXME: there is a bug if a thread acknowledges the new epoch, increments the global counter and then terminates,
-    // FIXME: leading to the total number of threads to be decremented, an easy fix would be to increment the update_epoch leading to the dist between,
-    // but is that correct?
-    // FIXME: is incrementing update_epoch here the correct solution? - this probably is a solution but with unnecessary overhead, try improving this!
-
-    // FIXME: this bug still isn't resolved tho as in case of local updates
-    GLOBAL_INFO.update_epoch.fetch_add(1, Ordering::AcqRel);
-    decrement_threads();
 }
 
 #[inline(never)]
@@ -339,32 +358,14 @@ pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     unsafe {
         (&mut *(&*local_ptr).pile.get()).push(Instance::new_explicit(
             val,
-            (&*local_ptr).epoch.get(),
+            (&*local_ptr).epoch.load(Ordering::Relaxed),
             cleanup,
         ));
     }
-    let new_epoch = increment_epoch().epoch;
-    unsafe { &*local_ptr }.epoch.set(new_epoch);
-
-    let mut curr_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
-    loop {
-        match GLOBAL_INFO.update_epoch.compare_exchange(
-            curr_epoch,
-            new_epoch,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(next_epoch) => {
-                if next_epoch > new_epoch {
-                    // fail as there was a more recent update than us
-                    break;
-                }
-                // retry setting our epoch
-                curr_epoch = next_epoch;
-            }
-        }
-    }
+    let new_epoch = increment_update_epoch();
+    unsafe { &*local_ptr }
+        .epoch
+        .store(new_epoch, Ordering::Release);
 }
 
 pub(crate) unsafe fn retire<T>(val: *const T) {
@@ -491,44 +492,50 @@ mod conc_linked_list {
             }
         }
 
-        pub(crate) fn try_drain<F: Fn(&T) -> bool>(&self, decision: F) -> bool {
+        pub(crate) fn try_drain<F: FnMut(&T) -> bool>(&self, mut decision: F) -> bool {
             match self
                 .flags
                 .compare_exchange(0, DRAIN_FLAG, Ordering::AcqRel, Ordering::Relaxed)
             {
                 Ok(_) => {
-                    let mut next = &self.root;
-                    loop {
-                        let ptr = next.load(Ordering::Acquire);
-                        match unsafe { ptr.as_ref() } {
-                            Some(node) => {
-                                let rem = decision(&node.val);
-                                if rem {
-                                    let next_ptr = node.next.load(Ordering::Acquire);
-                                    match next.compare_exchange(
-                                        ptr,
-                                        next_ptr,
-                                        Ordering::AcqRel,
-                                        Ordering::Relaxed,
-                                    ) {
-                                        Ok(_) => break,
-                                        Err(mut node) => loop {
-                                            let new_next = unsafe { node.as_ref().unwrap() }
-                                                .next
-                                                .load(Ordering::Acquire);
-                                            if new_next == ptr {
-                                                unsafe { node.as_ref().unwrap() }
-                                                    .next
-                                                    .store(next_ptr, Ordering::Release);
-                                                break;
-                                            }
-                                            node = new_next;
-                                        },
-                                    }
+                    let mut node_src = &self.root;
+                    let mut node = node_src.load(Ordering::Acquire);
+                    while !node.is_null() {
+                        let rem = decision(&unsafe { &*node }.val);
+                        if rem {
+                            let next = unsafe { &*node }.next.load(Ordering::Acquire);
+                            match node_src.compare_exchange(
+                                node,
+                                next,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => {
+                                    // delete node
+                                    let _ = unsafe { Box::from_raw(node) };
+                                    node = node_src.load(Ordering::Acquire);
                                 }
-                                next = &node.next;
+                                Err(mut new) => {
+                                    // the update failed so our src has to have been head and a push must have happened
+
+                                    // try finding the parent of the to be removed node, starting from the beginning
+                                    loop {
+                                        node_src = &unsafe { &*new }.next;
+                                        new = node_src.load(Ordering::Acquire);
+                                        if new == node {
+                                            break;
+                                        }
+                                    }
+                                    let next = unsafe { &*new }.next.load(Ordering::Acquire);
+                                    node_src.store(next, Ordering::Release);
+                                    // delete node
+                                    let _ = unsafe { Box::from_raw(node) };
+                                    node = next;
+                                }
                             }
-                            None => break,
+                        } else {
+                            node_src = &unsafe { &*node }.next;
+                            node = node_src.load(Ordering::Acquire);
                         }
                     }
                     self.flags.store(0, Ordering::Release);
