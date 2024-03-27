@@ -1,7 +1,6 @@
 use cfg_if::cfg_if;
 use core::{
-    alloc::Layout,
-    cell::{Cell, UnsafeCell},
+    cell::UnsafeCell,
     mem::transmute,
     ptr::{drop_in_place, null_mut},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
@@ -12,7 +11,6 @@ use likely_stable::unlikely;
 cfg_if! {
     if #[cfg(not(feature = "no_std"))] {
         use std::thread_local;
-        use std::alloc::{alloc, dealloc};
     } else {
         use alloc::{
             alloc::{alloc, dealloc},
@@ -21,12 +19,9 @@ cfg_if! {
     }
 }
 
-use self::conc_linked_list::ConcLinkedList;
+use crate::epoch::conc_linked_list::ConcLinkedListNode;
 
-#[cfg(target_pointer_width = "64")]
-type UFourth = u16;
-#[cfg(target_pointer_width = "32")]
-type UFourth = u8;
+use self::conc_linked_list::ConcLinkedList;
 
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     pile: CachePadded::new(ConcLinkedList::new()),
@@ -37,13 +32,14 @@ static GLOBAL_INFO: GlobalInfo = GlobalInfo {
 
 struct GlobalInfo {
     pile: CachePadded<ConcLinkedList<Instance>>,
-    locals: CachePadded<ConcLinkedList<*const Inner>>, // FIXME: cache reusable locals
+    locals: CachePadded<ConcLinkedList<Inner>>, // FIXME: cache reusable locals
     update_epoch: AtomicUsize,
     min_safe_epoch: AtomicUsize,
 }
 
 #[thread_local]
-static LOCAL_INFO: SyncUnsafeCell<*const Inner> = SyncUnsafeCell::new(null_mut());
+static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> =
+    SyncUnsafeCell::new(null_mut());
 
 thread_local! {
     static LOCAL_GUARD: LocalGuard = const { LocalGuard };
@@ -79,17 +75,25 @@ impl Drop for LocalGuard {
             if local.active_shared.load(Ordering::Acquire)
                 == local.active_local.load(Ordering::Acquire)
             {
-                // there are no more external references, so local can be cleaned up immediately
-                // FIXME: don't iterate the whole list but only check a single entry (and store said entry in the local itself)
-                if GLOBAL_INFO.locals.try_drain(|curr| *curr == local) {
-                    cleanup_local(local);
-                } else {
-                    // set the indicator to ensure others can destroy this local
-                    local.epoch.store(
-                        local.epoch.load(Ordering::Acquire) | LOCAL_DESTROYED,
-                        Ordering::Release,
-                    );
+                #[inline]
+                fn finish(local: *const Inner) {
+                    // there are no more external references, so local can be cleaned up immediately
+                    // FIXME: don't iterate the whole list but only check a single entry (and store said entry in the local itself)
+                    if GLOBAL_INFO
+                        .locals
+                        .try_drain(|curr| curr as *const _ == local)
+                    {
+                        // we don't have to cleanup the local as its in the same allocation as the node
+                    } else {
+                        let local = unsafe { &*local };
+                        // set the indicator to ensure others can destroy this local
+                        local.epoch.store(
+                            local.epoch.load(Ordering::Acquire) | LOCAL_DESTROYED,
+                            Ordering::Release,
+                        );
+                    }
                 }
+                finish(local as *const Inner);
             } else {
                 // NOTE: at this point we know that there must be external references
                 // to data retrieves through this guard remaining
@@ -130,14 +134,14 @@ unsafe impl Send for Instance {}
 unsafe impl Sync for Instance {}
 
 #[inline]
-fn local_ptr() -> *const Inner {
+fn local_ptr() -> *const ConcLinkedListNode<Inner> {
     let src = LOCAL_INFO.get();
     unsafe { *src }
 }
 
 #[inline]
 fn try_get_local<'a>() -> Option<&'a Inner> {
-    unsafe { local_ptr().as_ref() }
+    unsafe { local_ptr().as_ref().map(|node| node.val()) }
 }
 
 #[inline]
@@ -147,21 +151,16 @@ fn get_local<'a>() -> &'a Inner {
     fn alloc_local<'a>() -> &'a Inner {
         let src = LOCAL_INFO.get();
         unsafe {
-            let alloc = alloc(Layout::new::<Inner>()).cast::<Inner>();
-            if alloc.is_null() {
-                // allocation failed, just exit
-                abort();
-            }
-            alloc.write(Inner {
+            let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner {
                 pile: SyncUnsafeCell::new(Vec::new()),
                 epoch: AtomicUsize::new(GLOBAL_INFO.update_epoch.load(Ordering::Acquire)),
                 active_local: AtomicUsize::new(0),
                 active_shared: AtomicUsize::new(0),
-            });
+            })));
             *src = alloc;
-            GLOBAL_INFO.locals.push_front(alloc); // FIXME: this line has a heavy read perf penalty
+            GLOBAL_INFO.locals.push_front_optimistic(alloc); // FIXME: this line has a heavy read perf penalty
             LOCAL_GUARD.with(|_| {});
-            &*alloc
+            (&*alloc).val()
         }
     }
 
@@ -179,17 +178,13 @@ fn get_local<'a>() -> &'a Inner {
 pub(crate) fn pin() -> LocalPinGuard {
     let local_info = get_local();
     // this is relaxed as we know that we are the only thread currently to modify any local data
-    let active = local_info
-        .active_local
-        .load(Ordering::Relaxed);
+    let active = local_info.active_local.load(Ordering::Relaxed);
     local_info.active_local.store(active + 1, Ordering::Release);
     if active != 0 {
         return LocalPinGuard(local_info as *const Inner);
     }
     let update_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
-    let local = local_info
-        .epoch
-        .load(Ordering::Relaxed);
+    let local = local_info.epoch.load(Ordering::Relaxed);
     if update_epoch > local {
         update_local(local_info);
     }
@@ -293,11 +288,9 @@ fn update_local(local_info: &Inner) {
     }
     let mut min_used = usize::MAX;
     GLOBAL_INFO.locals.try_drain(|local| {
-        let local_epoch = unsafe { local.as_ref().unwrap_unchecked() }
-            .epoch
-            .load(Ordering::Acquire);
+        let local_epoch = local.epoch.load(Ordering::Acquire);
         if local_epoch & LOCAL_DESTROYED != 0 {
-            cleanup_local(*local);
+            // we don't have to cleanup local as its inlined inside the node's allocation
             return true;
         }
         // at this point we know that the local is either still in use locally or should be cleaned up by its remaining remote users
@@ -309,8 +302,8 @@ fn update_local(local_info: &Inner) {
             // the active_shared we observed (=> not in use) or being larger than active the active shared we observed (=> in use) which would only delay
             // us cleaning up the garbage which is okay
             // TODO: is this okay performance-wise (for the cache) or should we instead add a flag into the epoch variable and check that?
-            let in_use = unsafe { &**local }.active_shared.load(Ordering::Acquire)
-                != unsafe { &**local }.active_local.load(Ordering::Acquire);
+            let in_use = local.active_shared.load(Ordering::Acquire)
+                != local.active_local.load(Ordering::Acquire);
             if in_use && local_epoch < min_used {
                 min_used = local_epoch;
             }
@@ -346,29 +339,20 @@ fn update_local(local_info: &Inner) {
 
 const LOCAL_DESTROYED: usize = 1 << (usize::BITS - 1);
 
-#[inline]
-fn cleanup_local(local: *const Inner) {
-    unsafe {
-        drop_in_place(local as *mut Inner);
-    }
-    unsafe {
-        dealloc(local as *const Inner as *mut u8, Layout::new::<Inner>());
-    }
-}
-
 // #[inline(never)]
 #[inline]
 pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     let local_ptr = local_ptr();
     unsafe {
-        (&mut *(&*local_ptr).pile.get()).push(Instance::new_explicit(
+        (&mut *(&*local_ptr).val().pile.get()).push(Instance::new_explicit(
             val,
-            (&*local_ptr).epoch.load(Ordering::Relaxed),
+            (&*local_ptr).val().epoch.load(Ordering::Relaxed),
             cleanup,
         ));
     }
     let new_epoch = increment_update_epoch();
     unsafe { &*local_ptr }
+        .val()
         .epoch
         .store(new_epoch, Ordering::Release);
 }
@@ -399,7 +383,11 @@ impl Drop for LocalPinGuard {
     fn drop(&mut self) {
         // reduce local cnt safely even if src thread terminated
 
-        let local_ptr = local_ptr();
+        let local_ptr = unsafe {
+            local_ptr()
+                .byte_add(ConcLinkedListNode::<Inner>::addr_offset())
+                .cast::<Inner>()
+        };
         // fast path for thread local releases
         if self.0 == local_ptr {
             let local = unsafe { &*local_ptr };
@@ -445,12 +433,14 @@ unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 
 mod conc_linked_list {
     use core::{
+        mem::offset_of,
         ptr::null_mut,
         sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     };
 
     #[cfg(feature = "no_std")]
     use alloc::boxed::Box;
+    use likely_stable::unlikely;
 
     pub(crate) struct ConcLinkedList<T> {
         root: AtomicPtr<ConcLinkedListNode<T>>,
@@ -480,20 +470,61 @@ mod conc_linked_list {
                 next: AtomicPtr::new(null_mut()),
                 val,
             }));
-            let mut curr = self.root.load(Ordering::Acquire);
+            // this may be relaxed as we aren't accessing any data from curr and only need to confirm
+            // that it is the current value of root (even after storing it into our next value)
+            let mut curr = self.root.load(Ordering::Relaxed);
             loop {
-                unsafe { node.as_ref().unwrap() }
-                    .next
-                    .store(curr, Ordering::Release);
+                *unsafe { &mut *node }.next.get_mut() = curr;
+                // FIXME: explain the release ordering here
                 match self
                     .root
-                    .compare_exchange(curr, node, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(curr, node, Ordering::Release, Ordering::Acquire)
                 {
                     Ok(_) => break,
                     Err(new) => {
                         curr = new;
                     }
                 }
+            }
+        }
+
+        pub(crate) fn push_front_optimistic(&self, node: *mut ConcLinkedListNode<T>) {
+            // this may be relaxed as we aren't accessing any data from curr and only need to confirm
+            // that it is the current value of root (even after storing it into our next value)
+            let curr = self.root.load(Ordering::Relaxed);
+            *unsafe { &mut *node }.next.get_mut() = curr;
+            // FIXME: explain the release ordering here
+            if unlikely(
+                self.root
+                    .compare_exchange(curr, node, Ordering::Release, Ordering::Relaxed)
+                    .is_err(),
+            ) {
+                #[inline(never)]
+                #[cold]
+                fn push<T>(
+                    root: &AtomicPtr<ConcLinkedListNode<T>>,
+                    node: *mut ConcLinkedListNode<T>,
+                ) {
+                    // this may be relaxed as we aren't accessing any data from curr and only need to confirm
+                    // that it is the current value of root (even after storing it into our next value)
+                    let mut curr = root.load(Ordering::Relaxed);
+                    loop {
+                        *unsafe { &mut *node }.next.get_mut() = curr;
+                        // FIXME: explain the release ordering here
+                        match root.compare_exchange(
+                            curr,
+                            node,
+                            Ordering::Release,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => break,
+                            Err(new) => {
+                                curr = new;
+                            }
+                        }
+                    }
+                }
+                push(&self.root, node);
             }
         }
 
@@ -513,7 +544,7 @@ mod conc_linked_list {
                                 node,
                                 next,
                                 Ordering::AcqRel,
-                                Ordering::Relaxed,
+                                Ordering::Acquire,
                             ) {
                                 Ok(_) => {
                                     // delete node
@@ -553,9 +584,29 @@ mod conc_linked_list {
     }
 
     #[repr(align(4))]
-    struct ConcLinkedListNode<T> {
+    pub(crate) struct ConcLinkedListNode<T> {
         next: AtomicPtr<ConcLinkedListNode<T>>,
         val: T,
+    }
+
+    impl<T> ConcLinkedListNode<T> {
+        #[inline]
+        pub fn new(val: T) -> Self {
+            Self {
+                next: AtomicPtr::new(null_mut()),
+                val,
+            }
+        }
+
+        #[inline]
+        pub fn val(&self) -> &T {
+            &self.val
+        }
+
+        #[inline]
+        pub fn addr_offset() -> usize {
+            offset_of!(Self, val)
+        }
     }
 }
 
