@@ -29,16 +29,16 @@ type UFourth = u16;
 type UFourth = u8;
 
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
-    pile: ConcLinkedList::new(),
-    locals: ConcLinkedList::new(),
-    update_epoch: CachePadded::new(AtomicUsize::new(0)),
+    pile: CachePadded::new(ConcLinkedList::new()),
+    locals: CachePadded::new(ConcLinkedList::new()),
+    update_epoch: AtomicUsize::new(0),
     min_safe_epoch: AtomicUsize::new(0),
 };
 
 struct GlobalInfo {
-    pile: ConcLinkedList<Instance>,
-    locals: ConcLinkedList<*const Inner>, // FIXME: cache reusable locals
-    update_epoch: CachePadded<AtomicUsize>,
+    pile: CachePadded<ConcLinkedList<Instance>>,
+    locals: CachePadded<ConcLinkedList<*const Inner>>, // FIXME: cache reusable locals
+    update_epoch: AtomicUsize,
     min_safe_epoch: AtomicUsize,
 }
 
@@ -64,8 +64,9 @@ struct LocalGuard;
 impl Drop for LocalGuard {
     fn drop(&mut self) {
         if let Some(local) = try_get_local() {
+            let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
             for garbage in unsafe { &*local.pile.get() } {
-                if garbage.epoch < GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire) {
+                if garbage.epoch < min_safe {
                     // release garbage as nobody looks at it anymore
                     unsafe {
                         garbage.cleanup();
@@ -112,7 +113,7 @@ impl Instance {
 
     fn new_explicit<T>(val: *const T, epoch: usize, drop_fn: unsafe fn(*mut T)) -> Self {
         Self {
-            drop_fn: unsafe { core::mem::transmute::<_, fn(*mut ())>(drop_fn) },
+            drop_fn: unsafe { transmute::<_, fn(*mut ())>(drop_fn) },
             data_ptr: val.cast::<()>(),
             epoch,
         }
@@ -158,7 +159,7 @@ fn get_local<'a>() -> &'a Inner {
                 active_shared: AtomicUsize::new(0),
             });
             *src = alloc;
-            GLOBAL_INFO.locals.push_front(alloc);
+            GLOBAL_INFO.locals.push_front(alloc); // FIXME: this line has a heavy read perf penalty
             LOCAL_GUARD.with(|_| {});
             &*alloc
         }
@@ -172,14 +173,15 @@ fn get_local<'a>() -> &'a Inner {
 }
 
 /// This may not be called if there is already a pin active
-#[inline(never)]
-#[no_mangle]
+/*#[inline(never)]
+#[no_mangle]*/
+#[inline]
 pub(crate) fn pin() -> LocalPinGuard {
     let local_info = get_local();
     // this is relaxed as we know that we are the only thread currently to modify any local data
     let active = local_info
         .active_local
-        .load(Ordering::Acquire /*Ordering::Relaxed*/);
+        .load(Ordering::Relaxed);
     local_info.active_local.store(active + 1, Ordering::Release);
     if active != 0 {
         return LocalPinGuard(local_info as *const Inner);
@@ -187,13 +189,14 @@ pub(crate) fn pin() -> LocalPinGuard {
     let update_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
     let local = local_info
         .epoch
-        .load(Ordering::Acquire /*Ordering::Relaxed*/);
+        .load(Ordering::Relaxed);
     if update_epoch > local {
         update_local(local_info);
     }
     LocalPinGuard(local_info as *const Inner)
 }
 
+#[inline]
 fn increment_update_epoch() -> usize {
     #[cold]
     #[inline(never)]
@@ -343,6 +346,7 @@ fn update_local(local_info: &Inner) {
 
 const LOCAL_DESTROYED: usize = 1 << (usize::BITS - 1);
 
+#[inline]
 fn cleanup_local(local: *const Inner) {
     unsafe {
         drop_in_place(local as *mut Inner);
@@ -352,7 +356,8 @@ fn cleanup_local(local: *const Inner) {
     }
 }
 
-#[inline(never)]
+// #[inline(never)]
+#[inline]
 pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     let local_ptr = local_ptr();
     unsafe {
