@@ -185,6 +185,33 @@ impl<T> SwapArc<T> {
     }
 }
 
+#[cfg(feature = "ptr_ops")]
+impl<T> SwapArc<T> {
+    pub fn compare_exchange(
+        &self,
+        current: *const T,
+        new: Arc<T>,
+    ) -> Result<(), (Arc<T>, *const T)> {
+        let new_ptr = Arc::into_raw(new);
+        let pin = pin();
+        match pin.compare_exchange(
+            &self.it,
+            current,
+            new_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(val) => {
+                unsafe {
+                    retire_explicit(val, cleanup_arc::<T>);
+                }
+                Ok(())
+            }
+            Err(val) => Err((unsafe { Arc::from_raw(new_ptr) }, val)),
+        }
+    }
+}
+
 impl<T> Drop for SwapArc<T> {
     fn drop(&mut self) {
         let pin = pin();
@@ -231,6 +258,17 @@ impl<T> SwapIt<T> {
 
     pub fn store(&self, val: T) {
         self.bx.store(Box::new(val));
+    }
+}
+
+#[cfg(feature = "ptr_ops")]
+impl<T> SwapIt<T> {
+    pub fn compare_exchange(&self, current: *const T, new: T) -> Result<(), (T, *const T)> {
+        let new_ptr = Box::new(new);
+        match self.bx.compare_exchange(current, new_ptr) {
+            Ok(_) => Ok(()),
+            Err(err) => Err((err.0.into_inner(), err.1)),
+        }
     }
 }
 
