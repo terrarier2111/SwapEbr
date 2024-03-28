@@ -347,6 +347,7 @@ pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     local
         .epoch
         .store(new_epoch, Ordering::Release);
+    try_cleanup(local, new_epoch);
 }
 
 pub(crate) unsafe fn retire<T>(val: *const T) {
