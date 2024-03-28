@@ -5,6 +5,7 @@ use core::{
     ptr::{drop_in_place, null_mut},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+use std::thread;
 use crossbeam_utils::CachePadded;
 use likely_stable::unlikely;
 
@@ -21,7 +22,7 @@ cfg_if! {
 
 use crate::epoch::conc_linked_list::ConcLinkedListNode;
 
-use self::conc_linked_list::ConcLinkedList;
+use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
 
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     pile: CachePadded::new(ConcLinkedList::new()),
@@ -45,8 +46,10 @@ thread_local! {
     static LOCAL_GUARD: LocalGuard = const { LocalGuard };
 }
 
+const LOCAL_PILE_SIZE: usize = 64;
+
 struct Inner {
-    pile: SyncUnsafeCell<Vec<Instance>>,
+    pile: SyncUnsafeCell<RingBuffer<Instance, LOCAL_PILE_SIZE>>,
     epoch: AtomicUsize,
     active_local: AtomicUsize, // the MSB, if set indicates that this Inner is safe to remove
     active_shared: AtomicUsize,
@@ -61,7 +64,7 @@ impl Drop for LocalGuard {
     fn drop(&mut self) {
         if let Some(local) = try_get_local() {
             let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
-            for garbage in unsafe { &*local.pile.get() } {
+            for garbage in unsafe { &*local.pile.get() }.iter() {
                 if garbage.epoch < min_safe {
                     // release garbage as nobody looks at it anymore
                     unsafe {
@@ -152,7 +155,7 @@ fn get_local<'a>() -> &'a Inner {
         let src = LOCAL_INFO.get();
         unsafe {
             let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner {
-                pile: SyncUnsafeCell::new(Vec::new()),
+                pile: SyncUnsafeCell::new(RingBuffer::new()),
                 epoch: AtomicUsize::new(GLOBAL_INFO.update_epoch.load(Ordering::Acquire)),
                 active_local: AtomicUsize::new(0),
                 active_shared: AtomicUsize::new(0),
@@ -244,34 +247,20 @@ fn update_local(local_info: &Inner) {
     let new = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
     local_info.epoch.store(new, Ordering::Release);
 
+    try_cleanup(local_info, new);    
+}
+
+fn try_cleanup(local_info: &Inner, update_epoch: usize) {
     let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
 
     let local_pile = unsafe { &mut *local_info.pile.get() };
-    let mut rem_nodes = 0;
-    for item in local_pile.iter() {
-        if item.epoch < min_safe {
-            rem_nodes += 1;
-            unsafe {
-                item.cleanup();
-            }
-        } else {
-            break;
+    local_pile.evict_while(|item| {
+        let rem = unsafe { &*item }.epoch < min_safe;
+        if rem {
+            unsafe { (&*item).cleanup() };
         }
-    }
-    unsafe {
-        core::ptr::copy(
-            local_pile.as_mut_ptr().add(rem_nodes),
-            local_pile.as_mut_ptr(),
-            local_pile.len() - rem_nodes,
-        );
-    }
-    unsafe {
-        local_pile.set_len(local_pile.len() - rem_nodes);
-    }
-    // try resizing if necessary
-    if local_pile.len() * 3 < local_pile.capacity() {
-        local_pile.shrink_to(local_pile.capacity() / 2);
-    }
+        rem
+    });
     // try cleanup global
     GLOBAL_INFO.pile.try_drain(|val| {
         let remove = val.epoch < min_safe;
@@ -282,7 +271,7 @@ fn update_local(local_info: &Inner) {
         }
         remove
     });
-    if min_safe == new {
+    if min_safe == update_epoch {
         // don't try to update min_safe if it is already up-to-date
         return;
     }
@@ -294,7 +283,7 @@ fn update_local(local_info: &Inner) {
             return true;
         }
         // at this point we know that the local is either still in use locally or should be cleaned up by its remaining remote users
-        let outdated = local_epoch < new;
+        let outdated = local_epoch < update_epoch;
         if outdated {
             // the order in which these two loads happen in the comparison is very important!
             // we first load active_shared as it may only ever grow and never shrink and then active_local which may both grow and shrink (but never below active_shared)
@@ -311,7 +300,7 @@ fn update_local(local_info: &Inner) {
         false
     });
     let min_used = if min_used == usize::MAX {
-        new
+        update_epoch
     } else {
         min_used
     };
@@ -342,17 +331,20 @@ const LOCAL_DESTROYED: usize = 1 << (usize::BITS - 1);
 // #[inline(never)]
 #[inline]
 pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
-    let local_ptr = local_ptr();
-    unsafe {
-        (&mut *(&*local_ptr).val().pile.get()).push(Instance::new_explicit(
+    let local = get_local();
+    let old = unsafe {
+        (&mut *local.pile.get()).try_push_back(Instance::new_explicit(
             val,
-            (&*local_ptr).val().epoch.load(Ordering::Relaxed),
+            local.epoch.load(Ordering::Relaxed),
             cleanup,
-        ));
+        ))
+    };
+    // there is no more space in the local pile, try letting global handle our old garbage instead
+    if let Some(old) = old {
+        GLOBAL_INFO.pile.push_front(old);
     }
     let new_epoch = increment_update_epoch();
-    unsafe { &*local_ptr }
-        .val()
+    local
         .epoch
         .store(new_epoch, Ordering::Release);
 }
@@ -606,6 +598,89 @@ mod conc_linked_list {
         #[inline]
         pub fn addr_offset() -> usize {
             offset_of!(Self, val)
+        }
+    }
+}
+
+mod ring_buf {
+    use core::mem::MaybeUninit;
+
+    pub(crate) struct RingBuffer<T, const LEN: usize> {
+        buf: [MaybeUninit<T>; LEN],
+        head: usize,
+        len: usize,
+    }
+
+    impl<T, const LEN: usize> RingBuffer<T, LEN> {
+        pub const fn new() -> Self {
+            Self {
+                // TODO: use uninit_array instead, once stabilized
+                buf: unsafe { MaybeUninit::<[MaybeUninit<T>; LEN]>::uninit().assume_init() },
+                head: 0,
+                len: 0,
+            }
+        }
+
+        pub fn try_push_back(&mut self, val: T) -> Option<T> {
+            if self.len != LEN {
+                self.buf[(self.head + self.len) % LEN].write(val);
+                self.len += 1;
+                return None;
+            }
+
+            let old = unsafe { self.buf[(self.head + self.len) % LEN].assume_init_read() };
+            self.buf[(self.head + self.len) % LEN].write(val);
+            self.head += 1;
+            Some(old)
+        }
+
+        /// evicts elements starting from head until cond is false
+        pub fn evict_while<F: FnMut(*const T) -> bool>(&mut self, mut cond: F) {
+            for i in 0..self.len {
+                let idx = (self.head + i) % LEN;
+                let elem = self.buf[idx].as_ptr();
+                if !cond(elem) {
+                    self.head += i;
+                    self.len -= i;
+                    return;
+                }
+            }
+            self.head += self.len;
+            self.len = 0;
+        }
+
+        #[inline]
+        pub fn iter(&self) -> Iter<T, LEN> {
+            Iter { src: self, idx: 0 }
+        }
+
+        #[inline(always)]
+        pub const fn len(&self) -> usize {
+            self.len
+        }
+
+        #[inline]
+        pub const fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+    }
+
+    pub(crate) struct Iter<'a, T, const LEN: usize> {
+        src: &'a RingBuffer<T, LEN>,
+        idx: usize,
+    }
+
+    impl<'a, T, const LEN: usize> Iterator for Iter<'a, T, LEN> {
+        type Item = &'a T;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            debug_assert!(self.idx <= self.src.len());
+            if self.idx == self.src.len() {
+                return None;
+            }
+            let idx = self.src.head + self.idx;
+            self.idx += 1;
+            Some(unsafe { self.src.buf[idx % LEN].assume_init_ref() })
         }
     }
 }

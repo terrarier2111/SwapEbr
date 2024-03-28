@@ -920,7 +920,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -953,7 +953,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -986,7 +986,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -1019,7 +1019,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                         }
@@ -1052,7 +1052,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -1083,7 +1083,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -1114,7 +1114,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -1145,7 +1145,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                         }
@@ -1178,7 +1178,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -1209,7 +1209,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -1240,7 +1240,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             black_box(l1);
                         }
@@ -1271,7 +1271,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             black_box(l1);
                         }
@@ -1304,7 +1304,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             let l2 = tmp.load();
                             let l3 = tmp.load();
@@ -1343,7 +1343,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             let l2 = tmp.load();
                             let l3 = tmp.load();
@@ -1382,7 +1382,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load();
                             let l2 = tmp.load();
                             let l3 = tmp.load();
@@ -1421,7 +1421,7 @@ fn main() {
                         while !started.load(Ordering::Acquire) {
                             spin_loop();
                         }
-                        for _ in 0..20000 {
+                        for _ in 0..200000 {
                             let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             let l2 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
                             let l3 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
