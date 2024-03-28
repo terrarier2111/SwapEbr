@@ -52,7 +52,7 @@ fn main() {
         });
     });
 
-    /*c.bench_function("aarc_con/destruct", |b| {
+    c.bench_function("aarc_con/destruct", |b| {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
@@ -60,7 +60,7 @@ fn main() {
             }
             start.elapsed()
         });
-    });*/
+    });
 
     // ---
 

@@ -90,6 +90,33 @@ impl<T> SwapBox<T> {
     }
 }
 
+#[cfg(feature = "ptr_ops")]
+impl<T> SwapBox<T> {
+    pub fn compare_exchange(
+        &self,
+        current: *const T,
+        new: Box<T>,
+    ) -> Result<(), (Box<T>, *const T)> {
+        let new_ptr = Box::into_raw(new);
+        let pin = pin();
+        match pin.compare_exchange(
+            &self.it,
+            current,
+            new_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(val) => {
+                unsafe {
+                    retire_explicit(val, cleanup_box::<T>);
+                }
+                Ok(())
+            }
+            Err(val) => Err((unsafe { Box::from_raw(new_ptr) }, val)),
+        }
+    }
+}
+
 impl<T> Drop for SwapBox<T> {
     fn drop(&mut self) {
         let pin = pin();
@@ -103,6 +130,14 @@ impl<T> Drop for SwapBox<T> {
 pub struct BoxGuard<T> {
     _guard: LocalPinGuard,
     it: *const T,
+}
+
+#[cfg(feature = "ptr_ops")]
+impl<T> BoxGuard<T> {
+    #[inline(always)]
+    pub fn get_ptr(&self) -> *const T {
+        self.it
+    }
 }
 
 impl<T> Deref for BoxGuard<T> {

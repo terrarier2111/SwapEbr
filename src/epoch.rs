@@ -403,12 +403,27 @@ unsafe impl Sync for LocalPinGuard {}
 unsafe impl Send for LocalPinGuard {}
 
 impl LocalPinGuard {
+    #[inline]
     pub fn load<T>(&self, ptr: &Guarded<T>, order: Ordering) -> *const T {
         ptr.0.load(order)
     }
 
+    #[inline]
     pub fn swap<T>(&self, ptr: &Guarded<T>, val: *const T, order: Ordering) -> *const T {
         ptr.0.swap(val.cast_mut(), order)
+    }
+
+    #[inline]
+    pub fn compare_exchange<T>(
+        &self,
+        ptr: &Guarded<T>,
+        current: *const T,
+        new: *const T,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<*mut T, *mut T> {
+        ptr.0
+            .compare_exchange(current.cast_mut(), new.cast_mut(), success, failure)
     }
 }
 
@@ -484,6 +499,7 @@ mod conc_linked_list {
     const DRAIN_FLAG: usize = 1 << (usize::BITS as usize - 1);
 
     impl<T> ConcLinkedList<T> {
+        #[inline]
         pub(crate) const fn new() -> Self {
             Self {
                 root: AtomicPtr::new(null_mut()),
@@ -491,10 +507,12 @@ mod conc_linked_list {
             }
         }
 
+        #[inline]
         pub(crate) fn is_empty(&self) -> bool {
             self.root.load(Ordering::Acquire).is_null()
         }
 
+        #[inline]
         pub(crate) fn is_draining(&self) -> bool {
             self.flags.load(Ordering::Acquire) & DRAIN_FLAG != 0
         }

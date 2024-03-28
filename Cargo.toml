@@ -8,6 +8,7 @@ edition = "2021"
 [features]
 # default = ["no_std"]
 no_std = []
+ptr_ops = []
 
 [dependencies]
 crossbeam-utils = "0.8"
