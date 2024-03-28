@@ -23,6 +23,42 @@ use epoch::{pin, retire_explicit, Guarded, LocalPinGuard};
 
 mod epoch;
 
+pub(crate) mod reclamation {
+    use crate::epoch::LOCAL_PILE_SIZE;
+
+    // TODO: expose this once adt_const_params got stabilized
+    pub(crate) enum ReclamationMode {
+        // reclamation happens whenever possible (after storing a new value, after updating the local epoch, etc.)
+        // every single action triggers a reclamation attempt, there is no threshold to be crossed.
+        // => this mode is the least cpu-efficient mode as it reclaims garbage as often as possible
+        Eager,
+        // reclamation happens if a certain amount of possibly reclaiming actions happened such as
+        // (storing a new value, after updating the local epoch, etc.)
+        // the memory and cpu efficiency of this mode will strongly depend on the choice of the threshold parameter
+        Threshold { threshold: usize },
+        // reclamation only happens rarely after updating the local epoch and never after storing a new value
+        // in this mode only performing store operations from a single thread and no load operations
+        // will lead to its local garbage pile to fill up completely and only loading threads will slowly
+        // cleanup generated garbage through global
+        // => this mode is the most cpu-efficient mode as it reclaims garbage only rarely
+        Lazy,
+    }
+
+    // FIXME: lazy isn't currently as lazy as it could be, make it attempt to cleanup the writer's pile once its completely filled up and have a really
+    // large threshold for readers
+
+    impl ReclamationMode {
+        /// this mode is the same as Threshold with some predefined sane threshold value
+        #[allow(non_upper_case_globals)]
+        pub(crate) const Balanced: ReclamationMode = ReclamationMode::Threshold {
+            threshold: LOCAL_PILE_SIZE / 8,
+        };
+    }
+
+    pub(crate) const RECLAMATION_MODE: ReclamationMode = ReclamationMode::Balanced;
+    pub(crate) const LAZY_THRESHOLD: usize = LOCAL_PILE_SIZE;
+}
+
 pub struct SwapBox<T> {
     it: Guarded<T>,
 }

@@ -1,11 +1,10 @@
 use cfg_if::cfg_if;
 use core::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     mem::transmute,
     ptr::{drop_in_place, null_mut},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
-use std::thread;
 use crossbeam_utils::CachePadded;
 use likely_stable::unlikely;
 
@@ -20,7 +19,10 @@ cfg_if! {
     }
 }
 
-use crate::epoch::conc_linked_list::ConcLinkedListNode;
+use crate::{
+    epoch::conc_linked_list::ConcLinkedListNode,
+    reclamation::{ReclamationMode, LAZY_THRESHOLD, RECLAMATION_MODE},
+};
 
 use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
 
@@ -46,13 +48,15 @@ thread_local! {
     static LOCAL_GUARD: LocalGuard = const { LocalGuard };
 }
 
-const LOCAL_PILE_SIZE: usize = 64;
+pub(crate) const LOCAL_PILE_SIZE: usize = 64;
 
 struct Inner {
     pile: SyncUnsafeCell<RingBuffer<Instance, LOCAL_PILE_SIZE>>,
     epoch: AtomicUsize,
     active_local: AtomicUsize, // the MSB, if set indicates that this Inner is safe to remove
     active_shared: AtomicUsize,
+    // this is used for the threshold and lazy reclamation modes
+    action_cnt: Cell<usize>,
 }
 
 unsafe impl Send for Inner {}
@@ -159,9 +163,10 @@ fn get_local<'a>() -> &'a Inner {
                 epoch: AtomicUsize::new(GLOBAL_INFO.update_epoch.load(Ordering::Acquire)),
                 active_local: AtomicUsize::new(0),
                 active_shared: AtomicUsize::new(0),
+                action_cnt: Cell::new(0),
             })));
             *src = alloc;
-            GLOBAL_INFO.locals.push_front_optimistic(alloc); // FIXME: this line has a heavy read perf penalty
+            GLOBAL_INFO.locals.push_front_optimistic(alloc);
             LOCAL_GUARD.with(|_| {});
             (&*alloc).val()
         }
@@ -247,7 +252,29 @@ fn update_local(local_info: &Inner) {
     let new = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
     local_info.epoch.store(new, Ordering::Release);
 
-    try_cleanup(local_info, new);    
+    match RECLAMATION_MODE {
+        ReclamationMode::Eager => {
+            try_cleanup(local_info, new);
+        }
+        ReclamationMode::Threshold { threshold } => {
+            let curr_actions = local_info.action_cnt.get() + 1;
+            if curr_actions >= threshold {
+                try_cleanup(local_info, new);
+                local_info.action_cnt.set(0);
+            } else {
+                local_info.action_cnt.set(curr_actions);
+            }
+        }
+        ReclamationMode::Lazy => {
+            let curr_actions = local_info.action_cnt.get() + 1;
+            if curr_actions >= LAZY_THRESHOLD {
+                try_cleanup(local_info, new);
+                local_info.action_cnt.set(0);
+            } else {
+                local_info.action_cnt.set(curr_actions);
+            }
+        }
+    }
 }
 
 fn try_cleanup(local_info: &Inner, update_epoch: usize) {
@@ -339,15 +366,29 @@ pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
             cleanup,
         ))
     };
-    // there is no more space in the local pile, try letting global handle our old garbage instead
     if let Some(old) = old {
+        // there is no more space in the local pile, try letting global handle our old garbage instead
         GLOBAL_INFO.pile.push_front(old);
     }
     let new_epoch = increment_update_epoch();
-    local
-        .epoch
-        .store(new_epoch, Ordering::Release);
-    try_cleanup(local, new_epoch);
+    local.epoch.store(new_epoch, Ordering::Release);
+    match RECLAMATION_MODE {
+        ReclamationMode::Eager => {
+            try_cleanup(local, new_epoch);
+        }
+        ReclamationMode::Threshold { threshold } => {
+            let curr_actions = local.action_cnt.get() + 1;
+            if curr_actions >= threshold {
+                try_cleanup(local, new_epoch);
+                local.action_cnt.set(0);
+            } else {
+                local.action_cnt.set(curr_actions);
+            }
+        }
+        ReclamationMode::Lazy => {
+            // noop
+        }
+    }
 }
 
 pub(crate) unsafe fn retire<T>(val: *const T) {
