@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use cfg_if::cfg_if;
 use core::{
     cell::{Cell, UnsafeCell},
@@ -7,7 +6,6 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 use crossbeam_utils::CachePadded;
-use libc::ESRCH;
 use likely_stable::unlikely;
 
 use crate::{
@@ -33,6 +31,9 @@ struct GlobalInfo {
 
 cfg_if! {
     if #[cfg(feature = "no_std")] {
+        use libc::ESRCH;
+        use alloc::boxed::Box;
+
         #[thread_local]
         static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> =
             SyncUnsafeCell::new(null_mut());
@@ -157,7 +158,7 @@ unsafe impl Sync for Instance {}
 
 #[inline]
 fn local_ptr() -> *const ConcLinkedListNode<Inner> {
-    let src = LOCAL_INFO.get();
+    let src = LOCAL_INFO.with(|ptr| ptr.get());
     unsafe { *src }
 }
 
@@ -171,7 +172,7 @@ fn get_local<'a>() -> &'a Inner {
     #[cold]
     #[inline(never)]
     fn alloc_local<'a>() -> &'a Inner {
-        let src = LOCAL_INFO.get();
+        let src = LOCAL_INFO.with(|ptr| ptr.get());
         unsafe {
             let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner::new())));
             *src = alloc;
