@@ -1,9 +1,9 @@
-#![feature(thread_local)]
 #![cfg_attr(
     feature = "no_std",
     no_std,
     allow(internal_features),
-    feature(core_intrinsics)
+    feature(core_intrinsics),
+    feature(thread_local)
 )]
 
 cfg_if! {
@@ -16,10 +16,13 @@ cfg_if! {
     }
 }
 
-pub use crate::swap_arc::{ArcGuard, SwapArc};
 use cfg_if::cfg_if;
+pub use swap_arc::{ArcGuard, SwapArc};
+pub use swap_arc_option::{ArcOptionGuard, SwapArcOption};
 pub use swap_box::{BoxGuard, SwapBox};
+pub use swap_box_option::SwapBoxOption;
 pub use swap_it::SwapIt;
+pub use swap_it_option::SwapItOption;
 
 mod epoch;
 
@@ -114,8 +117,10 @@ mod swap_box {
                 Ordering::Acquire,
             ) {
                 Ok(val) => {
-                    unsafe {
-                        retire_explicit(val, cleanup_box::<T>);
+                    if !val.is_null() {
+                        unsafe {
+                            retire_explicit(val, cleanup_box::<T>);
+                        }
                     }
                     Ok(())
                 }
@@ -135,8 +140,8 @@ mod swap_box {
     }
 
     pub struct BoxGuard<T> {
-        _guard: LocalPinGuard,
-        it: *const T,
+        pub(crate) _guard: LocalPinGuard,
+        pub(crate) it: *const T,
     }
 
     #[cfg(feature = "ptr_ops")]
@@ -158,6 +163,100 @@ mod swap_box {
 
     unsafe impl<T> Send for BoxGuard<T> {}
     unsafe impl<T> Sync for BoxGuard<T> {}
+}
+
+mod swap_box_option {
+    use core::{ptr::null, sync::atomic::Ordering};
+
+    use crate::{
+        cleanup_box,
+        epoch::{pin, retire_explicit, Guarded},
+        BoxGuard,
+    };
+
+    pub struct SwapBoxOption<T> {
+        it: Guarded<T>,
+    }
+
+    impl<T> SwapBoxOption<T> {
+        pub fn new(val: Option<Box<T>>) -> Self {
+            let ptr = match val {
+                Some(val) => Box::into_raw(val),
+                None => null(),
+            };
+            Self {
+                it: Guarded::new(ptr.cast_mut()),
+            }
+        }
+
+        pub fn load(&self) -> Option<BoxGuard<T>> {
+            let pin = pin();
+            let ptr = pin.load(&self.it, Ordering::Acquire);
+            if ptr.is_null() {
+                return None;
+            }
+            Some(BoxGuard {
+                it: ptr,
+                _guard: pin,
+            })
+        }
+
+        pub fn store(&self, val: Box<T>) {
+            let ptr = Box::into_raw(val);
+            let pin = pin();
+            let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
+            if old.is_null() {
+                // don't cleanup inexistant values
+                return;
+            }
+            unsafe {
+                retire_explicit(old, cleanup_box::<T>);
+            }
+        }
+    }
+
+    #[cfg(feature = "ptr_ops")]
+    impl<T> SwapBoxOption<T> {
+        pub fn compare_exchange(
+            &self,
+            current: *const T,
+            new: Box<T>,
+        ) -> Result<(), (Box<T>, *const T)> {
+            let new_ptr = Box::into_raw(new);
+            let pin = pin();
+            match pin.compare_exchange(
+                &self.it,
+                current,
+                new_ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(val) => {
+                    if !val.is_null() {
+                        unsafe {
+                            retire_explicit(val, cleanup_box::<T>);
+                        }
+                    }
+                    Ok(())
+                }
+                Err(val) => Err((unsafe { Box::from_raw(new_ptr) }, val)),
+            }
+        }
+    }
+
+    impl<T> Drop for SwapBoxOption<T> {
+        fn drop(&mut self) {
+            let pin = pin();
+            let curr = pin.load(&self.it, Ordering::Acquire);
+            if curr.is_null() {
+                // don't cleanup inexistant values
+                return;
+            }
+            unsafe {
+                retire_explicit(curr, cleanup_box::<T>);
+            }
+        }
+    }
 }
 
 mod swap_arc {
@@ -260,12 +359,7 @@ mod swap_arc {
 }
 
 mod swap_arc_option {
-    use core::{
-        mem::ManuallyDrop,
-        ops::Deref,
-        ptr::{null, null_mut},
-        sync::atomic::Ordering,
-    };
+    use core::{mem::ManuallyDrop, ops::Deref, ptr::null, sync::atomic::Ordering};
 
     #[cfg(feature = "no_std")]
     use alloc::sync::Arc;
@@ -327,7 +421,7 @@ mod swap_arc_option {
     }
 
     #[cfg(feature = "ptr_ops")]
-    impl<T> SwapArc<T> {
+    impl<T> SwapArcOption<T> {
         pub fn compare_exchange(
             &self,
             current: *const T,
@@ -343,8 +437,10 @@ mod swap_arc_option {
                 Ordering::Acquire,
             ) {
                 Ok(val) => {
-                    unsafe {
-                        retire_explicit(val, cleanup_arc::<T>);
+                    if !val.is_null() {
+                        unsafe {
+                            retire_explicit(val, cleanup_arc::<T>);
+                        }
                     }
                     Ok(())
                 }
@@ -410,6 +506,41 @@ mod swap_it {
 
     #[cfg(feature = "ptr_ops")]
     impl<T> SwapIt<T> {
+        pub fn compare_exchange(&self, current: *const T, new: T) -> Result<(), (T, *const T)> {
+            let new_ptr = Box::new(new);
+            match self.bx.compare_exchange(current, new_ptr) {
+                Ok(_) => Ok(()),
+                Err(err) => Err((err.0.into_inner(), err.1)),
+            }
+        }
+    }
+}
+
+mod swap_it_option {
+    use crate::{BoxGuard, SwapBoxOption};
+
+    pub struct SwapItOption<T> {
+        bx: SwapBoxOption<T>,
+    }
+
+    impl<T> SwapItOption<T> {
+        pub fn new(val: Option<T>) -> Self {
+            Self {
+                bx: SwapBoxOption::new(val.map(|val| Box::new(val))),
+            }
+        }
+
+        pub fn load(&self) -> Option<BoxGuard<T>> {
+            self.bx.load()
+        }
+
+        pub fn store(&self, val: T) {
+            self.bx.store(Box::new(val));
+        }
+    }
+
+    #[cfg(feature = "ptr_ops")]
+    impl<T> SwapItOption<T> {
         pub fn compare_exchange(&self, current: *const T, new: T) -> Result<(), (T, *const T)> {
             let new_ptr = Box::new(new);
             match self.bx.compare_exchange(current, new_ptr) {
