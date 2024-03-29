@@ -16,9 +16,9 @@ cfg_if! {
     }
 }
 
+pub use crate::swap_arc::{ArcGuard, SwapArc};
 use cfg_if::cfg_if;
 pub use swap_box::{BoxGuard, SwapBox};
-pub use crate::swap_arc::{ArcGuard, SwapArc};
 pub use swap_it::SwapIt;
 
 mod epoch;
@@ -63,20 +63,22 @@ pub(crate) mod reclamation {
 mod swap_box {
     use core::{ops::Deref, sync::atomic::Ordering};
 
-    use crate::{cleanup_box, epoch::{pin, retire_explicit, Guarded, LocalPinGuard}};
-
+    use crate::{
+        cleanup_box,
+        epoch::{pin, retire_explicit, Guarded, LocalPinGuard},
+    };
 
     pub struct SwapBox<T> {
         it: Guarded<T>,
     }
-    
+
     impl<T> SwapBox<T> {
         pub fn new(val: Box<T>) -> Self {
             Self {
                 it: Guarded::new(Box::into_raw(val)),
             }
         }
-    
+
         pub fn load(&self) -> BoxGuard<T> {
             let pin = pin();
             BoxGuard {
@@ -84,7 +86,7 @@ mod swap_box {
                 _guard: pin,
             }
         }
-    
+
         pub fn store(&self, val: Box<T>) {
             let ptr = Box::into_raw(val);
             let pin = pin();
@@ -94,7 +96,7 @@ mod swap_box {
             }
         }
     }
-    
+
     #[cfg(feature = "ptr_ops")]
     impl<T> SwapBox<T> {
         pub fn compare_exchange(
@@ -121,7 +123,7 @@ mod swap_box {
             }
         }
     }
-    
+
     impl<T> Drop for SwapBox<T> {
         fn drop(&mut self) {
             let pin = pin();
@@ -131,12 +133,12 @@ mod swap_box {
             }
         }
     }
-    
+
     pub struct BoxGuard<T> {
         _guard: LocalPinGuard,
         it: *const T,
     }
-    
+
     #[cfg(feature = "ptr_ops")]
     impl<T> BoxGuard<T> {
         #[inline(always)]
@@ -144,19 +146,18 @@ mod swap_box {
             self.it
         }
     }
-    
+
     impl<T> Deref for BoxGuard<T> {
         type Target = T;
-    
+
         #[inline]
         fn deref(&self) -> &Self::Target {
             unsafe { &*self.it }
         }
     }
-    
+
     unsafe impl<T> Send for BoxGuard<T> {}
     unsafe impl<T> Sync for BoxGuard<T> {}
-
 }
 
 mod swap_arc {
@@ -167,20 +168,22 @@ mod swap_arc {
     #[cfg(not(feature = "no_std"))]
     use std::sync::Arc;
 
-    use crate::{cleanup_arc, epoch::{pin, retire_explicit, Guarded, LocalPinGuard}};
-
+    use crate::{
+        cleanup_arc,
+        epoch::{pin, retire_explicit, Guarded, LocalPinGuard},
+    };
 
     pub struct SwapArc<T> {
         it: Guarded<T>,
     }
-    
+
     impl<T> SwapArc<T> {
         pub fn new(val: Arc<T>) -> Self {
             Self {
                 it: Guarded::new(Arc::into_raw(val).cast_mut()),
             }
         }
-    
+
         pub fn load(&self) -> ArcGuard<T> {
             let pin = pin();
             ArcGuard {
@@ -190,7 +193,7 @@ mod swap_arc {
                 _guard: pin,
             }
         }
-    
+
         pub fn store(&self, val: Arc<T>) {
             let ptr = Arc::into_raw(val);
             let pin = pin();
@@ -200,7 +203,7 @@ mod swap_arc {
             }
         }
     }
-    
+
     #[cfg(feature = "ptr_ops")]
     impl<T> SwapArc<T> {
         pub fn compare_exchange(
@@ -227,7 +230,7 @@ mod swap_arc {
             }
         }
     }
-    
+
     impl<T> Drop for SwapArc<T> {
         fn drop(&mut self) {
             let pin = pin();
@@ -237,50 +240,174 @@ mod swap_arc {
             }
         }
     }
-    
+
     pub struct ArcGuard<T> {
         _guard: LocalPinGuard,
         it: ManuallyDrop<Arc<T>>,
     }
-    
+
     impl<T> Deref for ArcGuard<T> {
         type Target = Arc<T>;
-    
+
         #[inline]
         fn deref(&self) -> &Self::Target {
             self.it.deref()
         }
     }
-    
+
     unsafe impl<T> Send for ArcGuard<T> {}
     unsafe impl<T> Sync for ArcGuard<T> {}
+}
 
+mod swap_arc_option {
+    use core::{
+        mem::ManuallyDrop,
+        ops::Deref,
+        ptr::{null, null_mut},
+        sync::atomic::Ordering,
+    };
+
+    #[cfg(feature = "no_std")]
+    use alloc::sync::Arc;
+    #[cfg(not(feature = "no_std"))]
+    use std::sync::Arc;
+
+    use crate::{
+        cleanup_arc,
+        epoch::{pin, retire_explicit, Guarded, LocalPinGuard},
+    };
+
+    pub struct SwapArcOption<T> {
+        it: Guarded<T>,
+    }
+
+    impl<T> SwapArcOption<T> {
+        pub fn new(val: Option<Arc<T>>) -> Self {
+            Self {
+                it: Guarded::new(Self::val_to_ptr(val).cast_mut()),
+            }
+        }
+
+        pub fn load(&self) -> ArcOptionGuard<T> {
+            let pin = pin();
+            ArcOptionGuard {
+                it: ManuallyDrop::new(unsafe {
+                    Self::ptr_to_val(pin.load(&self.it, Ordering::Acquire))
+                }),
+                _guard: pin,
+            }
+        }
+
+        pub fn store(&self, val: Option<Arc<T>>) {
+            let ptr = Self::val_to_ptr(val);
+            let pin = pin();
+            let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
+            if old.is_null() {
+                // don't cleanup inexistant values
+                return;
+            }
+            unsafe {
+                retire_explicit(old, cleanup_arc::<T>);
+            }
+        }
+
+        fn val_to_ptr(val: Option<Arc<T>>) -> *const T {
+            match val {
+                Some(val) => Arc::into_raw(val),
+                None => null(),
+            }
+        }
+
+        unsafe fn ptr_to_val(ptr: *const T) -> Option<Arc<T>> {
+            if ptr.is_null() {
+                return None;
+            }
+            Some(unsafe { Arc::from_raw(ptr) })
+        }
+    }
+
+    #[cfg(feature = "ptr_ops")]
+    impl<T> SwapArc<T> {
+        pub fn compare_exchange(
+            &self,
+            current: *const T,
+            new: Arc<T>,
+        ) -> Result<(), (Arc<T>, *const T)> {
+            let new_ptr = Arc::into_raw(new);
+            let pin = pin();
+            match pin.compare_exchange(
+                &self.it,
+                current,
+                new_ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(val) => {
+                    unsafe {
+                        retire_explicit(val, cleanup_arc::<T>);
+                    }
+                    Ok(())
+                }
+                Err(val) => Err((unsafe { Arc::from_raw(new_ptr) }, val)),
+            }
+        }
+    }
+
+    impl<T> Drop for SwapArcOption<T> {
+        fn drop(&mut self) {
+            let pin = pin();
+            let curr = pin.load(&self.it, Ordering::Acquire);
+            if curr.is_null() {
+                // don't cleanup inexistant values
+                return;
+            }
+            unsafe {
+                retire_explicit(curr, cleanup_arc::<T>);
+            }
+        }
+    }
+
+    pub struct ArcOptionGuard<T> {
+        _guard: LocalPinGuard,
+        it: ManuallyDrop<Option<Arc<T>>>,
+    }
+
+    impl<T> Deref for ArcOptionGuard<T> {
+        type Target = Option<Arc<T>>;
+
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            self.it.deref()
+        }
+    }
+
+    unsafe impl<T> Send for ArcOptionGuard<T> {}
+    unsafe impl<T> Sync for ArcOptionGuard<T> {}
 }
 
 mod swap_it {
     use crate::{BoxGuard, SwapBox};
 
-
     pub struct SwapIt<T> {
         bx: SwapBox<T>,
     }
-    
+
     impl<T> SwapIt<T> {
         pub fn new(val: T) -> Self {
             Self {
                 bx: SwapBox::new(Box::new(val)),
             }
         }
-    
+
         pub fn load(&self) -> BoxGuard<T> {
             self.bx.load()
         }
-    
+
         pub fn store(&self, val: T) {
             self.bx.store(Box::new(val));
         }
     }
-    
+
     #[cfg(feature = "ptr_ops")]
     impl<T> SwapIt<T> {
         pub fn compare_exchange(&self, current: *const T, new: T) -> Result<(), (T, *const T)> {
@@ -291,7 +418,6 @@ mod swap_it {
             }
         }
     }
-
 }
 
 fn cleanup_box<T>(ptr: *mut T) {
