@@ -481,7 +481,7 @@ pub struct Guarded<T>(AtomicPtr<T>);
 
 impl<T> Guarded<T> {
     #[inline]
-    pub fn new(ptr: *mut T) -> Self {
+    pub const fn new(ptr: *mut T) -> Self {
         Self(AtomicPtr::new(ptr))
     }
 }
