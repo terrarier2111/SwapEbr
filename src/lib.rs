@@ -17,8 +17,9 @@ cfg_if! {
 }
 
 use cfg_if::cfg_if;
-use core::{mem::ManuallyDrop, ops::Deref, sync::atomic::Ordering};
-use epoch::{pin, retire_explicit, Guarded, LocalPinGuard};
+pub use swap_box::{BoxGuard, SwapBox};
+pub use crate::swap_arc::{ArcGuard, SwapArc};
+pub use swap_it::SwapIt;
 
 mod epoch;
 
@@ -59,211 +60,238 @@ pub(crate) mod reclamation {
     pub(crate) const LAZY_THRESHOLD: usize = LOCAL_PILE_SIZE;
 }
 
-pub struct SwapBox<T> {
-    it: Guarded<T>,
-}
+mod swap_box {
+    use core::{ops::Deref, sync::atomic::Ordering};
 
-impl<T> SwapBox<T> {
-    pub fn new(val: Box<T>) -> Self {
-        Self {
-            it: Guarded::new(Box::into_raw(val)),
-        }
+    use crate::{cleanup_box, epoch::{pin, retire_explicit, Guarded, LocalPinGuard}};
+
+
+    pub struct SwapBox<T> {
+        it: Guarded<T>,
     }
-
-    pub fn load(&self) -> BoxGuard<T> {
-        let pin = pin();
-        BoxGuard {
-            it: pin.load(&self.it, Ordering::Acquire),
-            _guard: pin,
-        }
-    }
-
-    pub fn store(&self, val: Box<T>) {
-        let ptr = Box::into_raw(val);
-        let pin = pin();
-        let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
-        unsafe {
-            retire_explicit(old, cleanup_box::<T>);
-        }
-    }
-}
-
-#[cfg(feature = "ptr_ops")]
-impl<T> SwapBox<T> {
-    pub fn compare_exchange(
-        &self,
-        current: *const T,
-        new: Box<T>,
-    ) -> Result<(), (Box<T>, *const T)> {
-        let new_ptr = Box::into_raw(new);
-        let pin = pin();
-        match pin.compare_exchange(
-            &self.it,
-            current,
-            new_ptr,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(val) => {
-                unsafe {
-                    retire_explicit(val, cleanup_box::<T>);
-                }
-                Ok(())
+    
+    impl<T> SwapBox<T> {
+        pub fn new(val: Box<T>) -> Self {
+            Self {
+                it: Guarded::new(Box::into_raw(val)),
             }
-            Err(val) => Err((unsafe { Box::from_raw(new_ptr) }, val)),
         }
-    }
-}
-
-impl<T> Drop for SwapBox<T> {
-    fn drop(&mut self) {
-        let pin = pin();
-        let curr = pin.load(&self.it, Ordering::Acquire);
-        unsafe {
-            retire_explicit(curr, cleanup_box::<T>);
-        }
-    }
-}
-
-pub struct BoxGuard<T> {
-    _guard: LocalPinGuard,
-    it: *const T,
-}
-
-#[cfg(feature = "ptr_ops")]
-impl<T> BoxGuard<T> {
-    #[inline(always)]
-    pub fn get_ptr(&self) -> *const T {
-        self.it
-    }
-}
-
-impl<T> Deref for BoxGuard<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.it }
-    }
-}
-
-unsafe impl<T> Send for BoxGuard<T> {}
-unsafe impl<T> Sync for BoxGuard<T> {}
-
-pub struct SwapArc<T> {
-    it: Guarded<T>,
-}
-
-impl<T> SwapArc<T> {
-    pub fn new(val: Arc<T>) -> Self {
-        Self {
-            it: Guarded::new(Arc::into_raw(val).cast_mut()),
-        }
-    }
-
-    pub fn load(&self) -> ArcGuard<T> {
-        let pin = pin();
-        ArcGuard {
-            it: ManuallyDrop::new(unsafe {
-                Arc::from_raw(pin.load(&self.it, Ordering::Acquire).cast_mut())
-            }),
-            _guard: pin,
-        }
-    }
-
-    pub fn store(&self, val: Arc<T>) {
-        let ptr = Arc::into_raw(val);
-        let pin = pin();
-        let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
-        unsafe {
-            retire_explicit(old, cleanup_arc::<T>);
-        }
-    }
-}
-
-#[cfg(feature = "ptr_ops")]
-impl<T> SwapArc<T> {
-    pub fn compare_exchange(
-        &self,
-        current: *const T,
-        new: Arc<T>,
-    ) -> Result<(), (Arc<T>, *const T)> {
-        let new_ptr = Arc::into_raw(new);
-        let pin = pin();
-        match pin.compare_exchange(
-            &self.it,
-            current,
-            new_ptr,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(val) => {
-                unsafe {
-                    retire_explicit(val, cleanup_arc::<T>);
-                }
-                Ok(())
+    
+        pub fn load(&self) -> BoxGuard<T> {
+            let pin = pin();
+            BoxGuard {
+                it: pin.load(&self.it, Ordering::Acquire),
+                _guard: pin,
             }
-            Err(val) => Err((unsafe { Arc::from_raw(new_ptr) }, val)),
+        }
+    
+        pub fn store(&self, val: Box<T>) {
+            let ptr = Box::into_raw(val);
+            let pin = pin();
+            let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
+            unsafe {
+                retire_explicit(old, cleanup_box::<T>);
+            }
         }
     }
-}
-
-impl<T> Drop for SwapArc<T> {
-    fn drop(&mut self) {
-        let pin = pin();
-        let curr = pin.load(&self.it, Ordering::Acquire);
-        unsafe {
-            retire_explicit(curr, cleanup_arc::<T>);
+    
+    #[cfg(feature = "ptr_ops")]
+    impl<T> SwapBox<T> {
+        pub fn compare_exchange(
+            &self,
+            current: *const T,
+            new: Box<T>,
+        ) -> Result<(), (Box<T>, *const T)> {
+            let new_ptr = Box::into_raw(new);
+            let pin = pin();
+            match pin.compare_exchange(
+                &self.it,
+                current,
+                new_ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(val) => {
+                    unsafe {
+                        retire_explicit(val, cleanup_box::<T>);
+                    }
+                    Ok(())
+                }
+                Err(val) => Err((unsafe { Box::from_raw(new_ptr) }, val)),
+            }
         }
     }
-}
-
-pub struct ArcGuard<T> {
-    _guard: LocalPinGuard,
-    it: ManuallyDrop<Arc<T>>,
-}
-
-impl<T> Deref for ArcGuard<T> {
-    type Target = Arc<T>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.it.deref()
+    
+    impl<T> Drop for SwapBox<T> {
+        fn drop(&mut self) {
+            let pin = pin();
+            let curr = pin.load(&self.it, Ordering::Acquire);
+            unsafe {
+                retire_explicit(curr, cleanup_box::<T>);
+            }
+        }
     }
+    
+    pub struct BoxGuard<T> {
+        _guard: LocalPinGuard,
+        it: *const T,
+    }
+    
+    #[cfg(feature = "ptr_ops")]
+    impl<T> BoxGuard<T> {
+        #[inline(always)]
+        pub fn get_ptr(&self) -> *const T {
+            self.it
+        }
+    }
+    
+    impl<T> Deref for BoxGuard<T> {
+        type Target = T;
+    
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.it }
+        }
+    }
+    
+    unsafe impl<T> Send for BoxGuard<T> {}
+    unsafe impl<T> Sync for BoxGuard<T> {}
+
 }
 
-unsafe impl<T> Send for ArcGuard<T> {}
-unsafe impl<T> Sync for ArcGuard<T> {}
+mod swap_arc {
+    use core::{mem::ManuallyDrop, ops::Deref, sync::atomic::Ordering};
 
-pub struct SwapIt<T> {
-    bx: SwapBox<T>,
+    #[cfg(feature = "no_std")]
+    use alloc::sync::Arc;
+    #[cfg(not(feature = "no_std"))]
+    use std::sync::Arc;
+
+    use crate::{cleanup_arc, epoch::{pin, retire_explicit, Guarded, LocalPinGuard}};
+
+
+    pub struct SwapArc<T> {
+        it: Guarded<T>,
+    }
+    
+    impl<T> SwapArc<T> {
+        pub fn new(val: Arc<T>) -> Self {
+            Self {
+                it: Guarded::new(Arc::into_raw(val).cast_mut()),
+            }
+        }
+    
+        pub fn load(&self) -> ArcGuard<T> {
+            let pin = pin();
+            ArcGuard {
+                it: ManuallyDrop::new(unsafe {
+                    Arc::from_raw(pin.load(&self.it, Ordering::Acquire).cast_mut())
+                }),
+                _guard: pin,
+            }
+        }
+    
+        pub fn store(&self, val: Arc<T>) {
+            let ptr = Arc::into_raw(val);
+            let pin = pin();
+            let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
+            unsafe {
+                retire_explicit(old, cleanup_arc::<T>);
+            }
+        }
+    }
+    
+    #[cfg(feature = "ptr_ops")]
+    impl<T> SwapArc<T> {
+        pub fn compare_exchange(
+            &self,
+            current: *const T,
+            new: Arc<T>,
+        ) -> Result<(), (Arc<T>, *const T)> {
+            let new_ptr = Arc::into_raw(new);
+            let pin = pin();
+            match pin.compare_exchange(
+                &self.it,
+                current,
+                new_ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(val) => {
+                    unsafe {
+                        retire_explicit(val, cleanup_arc::<T>);
+                    }
+                    Ok(())
+                }
+                Err(val) => Err((unsafe { Arc::from_raw(new_ptr) }, val)),
+            }
+        }
+    }
+    
+    impl<T> Drop for SwapArc<T> {
+        fn drop(&mut self) {
+            let pin = pin();
+            let curr = pin.load(&self.it, Ordering::Acquire);
+            unsafe {
+                retire_explicit(curr, cleanup_arc::<T>);
+            }
+        }
+    }
+    
+    pub struct ArcGuard<T> {
+        _guard: LocalPinGuard,
+        it: ManuallyDrop<Arc<T>>,
+    }
+    
+    impl<T> Deref for ArcGuard<T> {
+        type Target = Arc<T>;
+    
+        #[inline]
+        fn deref(&self) -> &Self::Target {
+            self.it.deref()
+        }
+    }
+    
+    unsafe impl<T> Send for ArcGuard<T> {}
+    unsafe impl<T> Sync for ArcGuard<T> {}
+
 }
 
-impl<T> SwapIt<T> {
-    pub fn new(val: T) -> Self {
-        Self {
-            bx: SwapBox::new(Box::new(val)),
+mod swap_it {
+    use crate::{BoxGuard, SwapBox};
+
+
+    pub struct SwapIt<T> {
+        bx: SwapBox<T>,
+    }
+    
+    impl<T> SwapIt<T> {
+        pub fn new(val: T) -> Self {
+            Self {
+                bx: SwapBox::new(Box::new(val)),
+            }
+        }
+    
+        pub fn load(&self) -> BoxGuard<T> {
+            self.bx.load()
+        }
+    
+        pub fn store(&self, val: T) {
+            self.bx.store(Box::new(val));
+        }
+    }
+    
+    #[cfg(feature = "ptr_ops")]
+    impl<T> SwapIt<T> {
+        pub fn compare_exchange(&self, current: *const T, new: T) -> Result<(), (T, *const T)> {
+            let new_ptr = Box::new(new);
+            match self.bx.compare_exchange(current, new_ptr) {
+                Ok(_) => Ok(()),
+                Err(err) => Err((err.0.into_inner(), err.1)),
+            }
         }
     }
 
-    pub fn load(&self) -> BoxGuard<T> {
-        self.bx.load()
-    }
-
-    pub fn store(&self, val: T) {
-        self.bx.store(Box::new(val));
-    }
-}
-
-#[cfg(feature = "ptr_ops")]
-impl<T> SwapIt<T> {
-    pub fn compare_exchange(&self, current: *const T, new: T) -> Result<(), (T, *const T)> {
-        let new_ptr = Box::new(new);
-        match self.bx.compare_exchange(current, new_ptr) {
-            Ok(_) => Ok(()),
-            Err(err) => Err((err.0.into_inner(), err.1)),
-        }
-    }
 }
 
 fn cleanup_box<T>(ptr: *mut T) {
