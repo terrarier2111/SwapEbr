@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use cfg_if::cfg_if;
 use core::{
     cell::{Cell, UnsafeCell},
@@ -6,18 +7,8 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 use crossbeam_utils::CachePadded;
+use libc::ESRCH;
 use likely_stable::unlikely;
-
-cfg_if! {
-    if #[cfg(not(feature = "no_std"))] {
-        use std::thread_local;
-    } else {
-        use alloc::{
-            alloc::{alloc, dealloc},
-            vec::Vec,
-        };
-    }
-}
 
 use crate::{
     epoch::conc_linked_list::ConcLinkedListNode,
@@ -40,15 +31,25 @@ struct GlobalInfo {
     min_safe_epoch: AtomicUsize,
 }
 
-#[thread_local]
-static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> =
-    SyncUnsafeCell::new(null_mut());
-
-thread_local! {
-    static LOCAL_GUARD: LocalGuard = const { LocalGuard };
+cfg_if! {
+    if #[cfg(feature = "no_std")] {
+        #[thread_local]
+        static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> =
+            SyncUnsafeCell::new(null_mut());
+    } else {
+        use std::thread_local;
+        // FIXME: are 2 seperate TLS variables actually better than 1 with an associated destructor?
+        thread_local! {
+            static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> = const { SyncUnsafeCell::new(null_mut()) };
+            static LOCAL_GUARD: LocalGuard = const { LocalGuard };
+        }
+    }
 }
 
 pub(crate) const LOCAL_PILE_SIZE: usize = 64;
+
+// FIXME: instead of checking if thread is still alive periodically, instead register a TLS destructor
+// using pthread_key_create
 
 struct Inner {
     pile: SyncUnsafeCell<RingBuffer<Instance, LOCAL_PILE_SIZE>>,
@@ -57,6 +58,22 @@ struct Inner {
     active_shared: AtomicUsize,
     // this is used for the threshold and lazy reclamation modes
     action_cnt: Cell<usize>,
+    #[cfg(feature = "no_std")]
+    origin_thread: libc::pthread_t,
+}
+
+impl Inner {
+    fn new() -> Self {
+        Self {
+            pile: SyncUnsafeCell::new(RingBuffer::new()),
+            epoch: AtomicUsize::new(GLOBAL_INFO.update_epoch.load(Ordering::Acquire)),
+            active_local: AtomicUsize::new(0),
+            active_shared: AtomicUsize::new(0),
+            action_cnt: Cell::new(0),
+            #[cfg(feature = "no_std")]
+            origin_thread: unsafe { libc::pthread_self() },
+        }
+    }
 }
 
 unsafe impl Send for Inner {}
@@ -67,45 +84,47 @@ struct LocalGuard;
 impl Drop for LocalGuard {
     fn drop(&mut self) {
         if let Some(local) = try_get_local() {
-            let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
-            for garbage in unsafe { &*local.pile.get() }.iter() {
-                if garbage.epoch < min_safe {
-                    // release garbage as nobody looks at it anymore
-                    unsafe {
-                        garbage.cleanup();
-                    }
-                } else {
-                    // push garbage onto pile
-                    GLOBAL_INFO.pile.push_front(garbage.clone());
-                }
+            destroy_local(local);
+        }
+    }
+}
+
+fn destroy_local(local: &Inner) {
+    let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
+    for garbage in unsafe { &*local.pile.get() }.iter() {
+        if garbage.epoch < min_safe {
+            // release garbage as nobody looks at it anymore
+            unsafe {
+                garbage.cleanup();
             }
-            if local.active_shared.load(Ordering::Acquire)
-                == local.active_local.load(Ordering::Acquire)
+        } else {
+            // push garbage onto pile
+            GLOBAL_INFO.pile.push_front(garbage.clone());
+        }
+    }
+    if local.active_shared.load(Ordering::Acquire) == local.active_local.load(Ordering::Acquire) {
+        #[inline]
+        fn finish(local: *const Inner) {
+            // there are no more external references, so local can be cleaned up immediately
+            // FIXME: don't iterate the whole list but only check a single entry (and store said entry in the local itself)
+            if GLOBAL_INFO
+                .locals
+                .try_drain(|curr| curr as *const _ == local)
             {
-                #[inline]
-                fn finish(local: *const Inner) {
-                    // there are no more external references, so local can be cleaned up immediately
-                    // FIXME: don't iterate the whole list but only check a single entry (and store said entry in the local itself)
-                    if GLOBAL_INFO
-                        .locals
-                        .try_drain(|curr| curr as *const _ == local)
-                    {
-                        // we don't have to cleanup the local as its in the same allocation as the node
-                    } else {
-                        let local = unsafe { &*local };
-                        // set the indicator to ensure others can destroy this local
-                        local.epoch.store(
-                            local.epoch.load(Ordering::Acquire) | LOCAL_DESTROYED,
-                            Ordering::Release,
-                        );
-                    }
-                }
-                finish(local as *const Inner);
+                // we don't have to cleanup the local as its in the same allocation as the node
             } else {
-                // NOTE: at this point we know that there must be external references
-                // to data retrieves through this guard remaining
+                let local = unsafe { &*local };
+                // set the indicator to ensure others can destroy this local
+                local.epoch.store(
+                    local.epoch.load(Ordering::Acquire) | LOCAL_DESTROYED,
+                    Ordering::Release,
+                );
             }
         }
+        finish(local as *const Inner);
+    } else {
+        // NOTE: at this point we know that there must be external references
+        // to data retrieves through this guard remaining
     }
 }
 
@@ -117,11 +136,7 @@ struct Instance {
 }
 
 impl Instance {
-    fn new<T>(val: *const T, epoch: usize) -> Self {
-        let drop_fn = core::ptr::drop_in_place::<T>;
-        Self::new_explicit(val, epoch, drop_fn)
-    }
-
+    #[inline]
     fn new_explicit<T>(val: *const T, epoch: usize, drop_fn: unsafe fn(*mut T)) -> Self {
         Self {
             drop_fn: unsafe { transmute::<_, fn(*mut ())>(drop_fn) },
@@ -158,15 +173,10 @@ fn get_local<'a>() -> &'a Inner {
     fn alloc_local<'a>() -> &'a Inner {
         let src = LOCAL_INFO.get();
         unsafe {
-            let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner {
-                pile: SyncUnsafeCell::new(RingBuffer::new()),
-                epoch: AtomicUsize::new(GLOBAL_INFO.update_epoch.load(Ordering::Acquire)),
-                active_local: AtomicUsize::new(0),
-                active_shared: AtomicUsize::new(0),
-                action_cnt: Cell::new(0),
-            })));
+            let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner::new())));
             *src = alloc;
             GLOBAL_INFO.locals.push_front_optimistic(alloc);
+            #[cfg(not(feature = "no_std"))]
             LOCAL_GUARD.with(|_| {});
             (&*alloc).val()
         }
@@ -180,8 +190,6 @@ fn get_local<'a>() -> &'a Inner {
 }
 
 /// This may not be called if there is already a pin active
-/*#[inline(never)]
-#[no_mangle]*/
 #[inline]
 pub(crate) fn pin() -> LocalPinGuard {
     let local_info = get_local();
@@ -298,6 +306,7 @@ fn try_cleanup(local_info: &Inner, update_epoch: usize) {
         }
         remove
     });
+    #[cfg(not(feature = "no_std"))]
     if min_safe == update_epoch {
         // don't try to update min_safe if it is already up-to-date
         return;
@@ -305,6 +314,11 @@ fn try_cleanup(local_info: &Inner, update_epoch: usize) {
     let mut min_used = usize::MAX;
     GLOBAL_INFO.locals.try_drain(|local| {
         let local_epoch = local.epoch.load(Ordering::Acquire);
+        #[cfg(feature = "no_std")]
+        if unsafe { libc::pthread_kill(local.origin_thread, 0) } == ESRCH {
+            // the thread has exited, so cleanup the remaining data
+            return true;
+        }
         if local_epoch & LOCAL_DESTROYED != 0 {
             // we don't have to cleanup local as its inlined inside the node's allocation
             return true;
@@ -326,6 +340,11 @@ fn try_cleanup(local_info: &Inner, update_epoch: usize) {
         }
         false
     });
+    #[cfg(feature = "no_std")]
+    if min_safe == update_epoch {
+        // don't try to update min_safe if it is already up-to-date
+        return;
+    }
     let min_used = if min_used == usize::MAX {
         update_epoch
     } else {
@@ -391,6 +410,7 @@ pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) unsafe fn retire<T>(val: *const T) {
     let drop_fn = drop_in_place::<T> as *const ();
     let drop_fn = unsafe { transmute(drop_fn) };
@@ -413,6 +433,8 @@ impl LocalPinGuard {
         ptr.0.swap(val.cast_mut(), order)
     }
 
+    // we need to allow dead code here as if the `ptr_ops` feature is disabled, this function won't be used
+    #[allow(dead_code)]
     #[inline]
     pub fn compare_exchange<T>(
         &self,
@@ -718,11 +740,6 @@ mod ring_buf {
         pub const fn len(&self) -> usize {
             self.len
         }
-
-        #[inline]
-        pub const fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
     }
 
     pub(crate) struct Iter<'a, T, const LEN: usize> {
@@ -741,6 +758,13 @@ mod ring_buf {
             let idx = self.src.head + self.idx;
             self.idx += 1;
             Some(unsafe { self.src.buf[idx % LEN].assume_init_ref() })
+        }
+    }
+
+    impl<'a, T, const LEN: usize> ExactSizeIterator for Iter<'a, T, LEN> {
+        #[inline]
+        fn len(&self) -> usize {
+            self.src.len() - self.idx
         }
     }
 }
@@ -812,7 +836,7 @@ mod untyped_vec {
     }
 }*/
 
-#[cfg(test)]
+#[cfg(all(not(feature = "no_std"), test))]
 mod test {
     use core::{mem::transmute, sync::atomic::Ordering};
     use std::sync::Arc;

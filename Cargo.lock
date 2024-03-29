@@ -11,6 +11,7 @@ dependencies = [
  "cfg-if",
  "criterion",
  "crossbeam-utils",
+ "libc",
  "likely_stable",
  "rand",
  "swap-arc",

@@ -7,13 +7,14 @@ edition = "2021"
 
 [features]
 # default = ["no_std"]
-no_std = []
+no_std = ["libc"]
 ptr_ops = []
 
 [dependencies]
 crossbeam-utils = "0.8"
 cfg-if = "1"
 likely_stable = "0.1"
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 rand = "0.8"

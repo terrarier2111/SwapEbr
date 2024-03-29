@@ -1,5 +1,4 @@
 #![feature(thread_local)]
-#![feature(const_type_name)]
 #![cfg_attr(
     feature = "no_std",
     no_std,
@@ -27,6 +26,7 @@ pub(crate) mod reclamation {
     use crate::epoch::LOCAL_PILE_SIZE;
 
     // TODO: expose this once adt_const_params got stabilized
+    #[allow(dead_code)]
     pub(crate) enum ReclamationMode {
         // reclamation happens whenever possible (after storing a new value, after updating the local epoch, etc.)
         // every single action triggers a reclamation attempt, there is no threshold to be crossed.
@@ -64,8 +64,6 @@ pub struct SwapBox<T> {
 }
 
 impl<T> SwapBox<T> {
-    const OPTION_LAYERS: usize = option_layers::<T>();
-
     pub fn new(val: Box<T>) -> Self {
         Self {
             it: Guarded::new(Box::into_raw(val)),
@@ -157,8 +155,6 @@ pub struct SwapArc<T> {
 }
 
 impl<T> SwapArc<T> {
-    const OPTION_LAYERS: usize = option_layers::<T>();
-
     pub fn new(val: Arc<T>) -> Self {
         Self {
             it: Guarded::new(Arc::into_raw(val).cast_mut()),
@@ -244,8 +240,6 @@ pub struct SwapIt<T> {
 }
 
 impl<T> SwapIt<T> {
-    const OPTION_LAYERS: usize = option_layers::<T>();
-
     pub fn new(val: T) -> Self {
         Self {
             bx: SwapBox::new(Box::new(val)),
@@ -280,8 +274,9 @@ fn cleanup_arc<T>(ptr: *mut T) {
     let _ = unsafe { Arc::from_raw(ptr) };
 }
 
+// TODO: use this once `const_type_name` got stabilized
 /// We use this count evaluation to store the Some() option count
-const fn option_layers<T>() -> usize {
+/*const fn option_layers<T>() -> usize {
     const OPTION_NAME: &str = "core::option::Option<";
 
     let ty_name = core::any::type_name::<T>();
@@ -300,7 +295,7 @@ const fn option_layers<T>() -> usize {
         layers += 1;
     }
     layers
-}
+}*/
 
 #[cfg(all(test, miri))]
 mod test {
