@@ -295,6 +295,11 @@ mod swap_box_option {
             Self(SwapOption::new(ptr))
         }
 
+        #[inline]
+        pub const fn new_empty() -> Self {
+            Self(SwapOption::new(null()))
+        }
+
         pub fn load(&self) -> Option<BoxGuard<T>> {
             let pin = pin();
             let ptr = pin.load(&self.0.it, Ordering::Acquire);
@@ -436,9 +441,13 @@ mod swap_arc_option {
     pub struct SwapArcOption<T>(SwapOption<T>);
 
     impl<T> SwapArcOption<T> {
-        #[inline]
         pub fn new(val: Option<Arc<T>>) -> Self {
             Self(SwapOption::new(Self::val_to_ptr(val)))
+        }
+
+        #[inline]
+        pub const fn new_empty() -> Self {
+            Self(SwapOption::new(null()))
         }
 
         pub fn load(&self) -> Option<ArcGuard<T>> {

@@ -179,7 +179,7 @@ fn get_local<'a>() -> &'a Inner {
             GLOBAL_INFO.locals.push_front_optimistic(alloc);
             #[cfg(not(feature = "no_std"))]
             LOCAL_GUARD.with(|_| {});
-            (&*alloc).val()
+            (*alloc).val()
         }
     }
 
@@ -293,7 +293,7 @@ fn try_cleanup(local_info: &Inner, update_epoch: usize) {
     local_pile.evict_while(|item| {
         let rem = unsafe { &*item }.epoch < min_safe;
         if rem {
-            unsafe { (&*item).cleanup() };
+            unsafe { (*item).cleanup() };
         }
         rem
     });
@@ -380,7 +380,7 @@ const LOCAL_DESTROYED: usize = 1 << (usize::BITS - 1);
 pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
     let local = get_local();
     let old = unsafe {
-        (&mut *local.pile.get()).try_push_back(Instance::new_explicit(
+        (*local.pile.get()).try_push_back(Instance::new_explicit(
             val,
             local.epoch.load(Ordering::Relaxed),
             cleanup,
@@ -535,11 +535,6 @@ mod conc_linked_list {
             self.root.load(Ordering::Acquire).is_null()
         }
 
-        #[inline]
-        pub(crate) fn is_draining(&self) -> bool {
-            self.flags.load(Ordering::Acquire) & DRAIN_FLAG != 0
-        }
-
         pub(crate) fn push_front(&self, val: T) {
             let node = Box::into_raw(Box::new(ConcLinkedListNode {
                 next: AtomicPtr::new(null_mut()),
@@ -604,6 +599,9 @@ mod conc_linked_list {
         }
 
         pub(crate) fn try_drain<F: FnMut(&T) -> bool>(&self, mut decision: F) -> bool {
+            if self.is_empty() {
+                return true;
+            }
             match self
                 .flags
                 .compare_exchange(0, DRAIN_FLAG, Ordering::AcqRel, Ordering::Relaxed)
