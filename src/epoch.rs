@@ -2,7 +2,7 @@ use cfg_if::cfg_if;
 use core::{
     cell::{Cell, UnsafeCell},
     mem::transmute,
-    ptr::{drop_in_place, null_mut},
+    ptr::{drop_in_place, null_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 use crossbeam_utils::CachePadded;
@@ -131,16 +131,16 @@ fn destroy_local(local: &Inner) {
 
 #[derive(Clone)]
 struct Instance {
-    drop_fn: unsafe fn(*mut ()),
-    data_ptr: *const (),
+    drop_fn: unsafe fn(NonNull<()>),
+    data_ptr: NonNull<()>,
     epoch: usize,
 }
 
 impl Instance {
     #[inline]
-    fn new_explicit<T>(val: *const T, epoch: usize, drop_fn: unsafe fn(*mut T)) -> Self {
+    fn new_explicit<T>(val: NonNull<T>, epoch: usize, drop_fn: unsafe fn(NonNull<T>)) -> Self {
         Self {
-            drop_fn: unsafe { transmute::<_, fn(*mut ())>(drop_fn) },
+            drop_fn: unsafe { transmute::<_, fn(NonNull<()>)>(drop_fn) },
             data_ptr: val.cast::<()>(),
             epoch,
         }
@@ -149,7 +149,7 @@ impl Instance {
     #[inline]
     unsafe fn cleanup(&self) {
         let drop_fn = self.drop_fn;
-        drop_fn(self.data_ptr.cast_mut());
+        drop_fn(self.data_ptr);
     }
 }
 
@@ -377,7 +377,7 @@ const LOCAL_DESTROYED: usize = 1 << (usize::BITS - 1);
 
 // #[inline(never)]
 #[inline]
-pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
+pub(crate) unsafe fn retire_explicit<T>(val: NonNull<T>, cleanup: fn(NonNull<T>)) {
     let local = get_local();
     let old = unsafe {
         (*local.pile.get()).try_push_back(Instance::new_explicit(
@@ -412,7 +412,7 @@ pub(crate) unsafe fn retire_explicit<T>(val: *const T, cleanup: fn(*mut T)) {
 }
 
 #[allow(dead_code)]
-pub(crate) unsafe fn retire<T>(val: *const T) {
+pub(crate) unsafe fn retire<T>(val: NonNull<T>) {
     let drop_fn = drop_in_place::<T> as *const ();
     let drop_fn = unsafe { transmute(drop_fn) };
     retire_explicit(val, drop_fn);
@@ -837,7 +837,7 @@ mod untyped_vec {
 
 #[cfg(all(not(feature = "no_std"), test))]
 mod test {
-    use core::{mem::transmute, sync::atomic::Ordering};
+    use core::{mem::transmute, ptr::NonNull, sync::atomic::Ordering};
     use std::sync::Arc;
     use std::thread;
 
@@ -866,7 +866,7 @@ mod test {
                 let curr = Box::new(format!("test{i}"));
                 let prev = pin.swap(&guard, Box::into_raw(curr), Ordering::AcqRel);
                 unsafe {
-                    retire_explicit(prev, cleanup_fn);
+                    retire_explicit(NonNull::new(prev.cast_mut()).unwrap(), cleanup_fn);
                 }
             }
             println!("finished2");
@@ -875,14 +875,17 @@ mod test {
             let curr = Box::new(format!("test{i}"));
             let prev = pin.swap(&guard, Box::into_raw(curr), Ordering::AcqRel);
             unsafe {
-                retire_explicit(prev, cleanup_fn);
+                retire_explicit(NonNull::new(prev.cast_mut()).unwrap(), cleanup_fn);
             }
         }
         println!("finished1");
 
         other.join().unwrap();
         unsafe {
-            retire_explicit(pin.load(&guard, Ordering::Acquire), cleanup_fn);
+            retire_explicit(
+                NonNull::new(pin.load(&guard, Ordering::Acquire).cast_mut()).unwrap(),
+                cleanup_fn,
+            );
         }
     }
 }
