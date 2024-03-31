@@ -32,6 +32,10 @@ pub type SwapArcOption<T> = SwapOption<Arc<T>, T>;
 pub type SwapBox<T> = Swap<Box<T>, T>;
 pub type SwapBoxOption<T> = SwapOption<Box<T>, T>;
 
+pub fn new_unsized<T: ?Sized>(val: Box<T>) -> Swap<Box<Box<T>>, Box<T>> {
+    Swap::new(Box::new(val))
+}
+
 pub(crate) mod reclamation {
     use crate::epoch::LOCAL_PILE_SIZE;
 
@@ -225,10 +229,7 @@ mod standard_option {
                 return;
             }
             unsafe {
-                retire_explicit(
-                    unsafe { NonNull::new_unchecked(old.cast_mut()) },
-                    cleanup::<T, U>,
-                );
+                retire_explicit(NonNull::new_unchecked(old.cast_mut()), cleanup::<T, U>);
             }
         }
     }
