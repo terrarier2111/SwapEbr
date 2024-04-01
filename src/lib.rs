@@ -166,13 +166,13 @@ mod standard {
         }
     }
 
-    /*#[cfg(feature = "ptr_ops")]
-    impl<T> SwapGuard<T> {
+    #[cfg(feature = "ptr_ops")]
+    impl<T: PtrConvert<U>, U> SwapGuard<T, U> {
         #[inline(always)]
-        pub fn get_ptr(&self) -> *const T {
-            self.val.as_ptr()
+        pub fn get_ptr(&self) -> NonNull<U> {
+            T::guard_to_ptr(&self.val)
         }
-    }*/
+    }
 
     unsafe impl<T: PtrConvert<U>, U> Send for SwapGuard<T, U> {}
     unsafe impl<T: PtrConvert<U>, U> Sync for SwapGuard<T, U> {}
@@ -392,6 +392,8 @@ pub trait PtrConvert<T: ?Sized>: Sized {
 
     fn guard_val(ptr: NonNull<T>) -> Self::GuardVal;
 
+    fn guard_to_ptr(guard: &Self::GuardVal) -> NonNull<T>;
+
     fn deref_guard(guard: &Self::GuardVal) -> &Self::GuardDeref;
 }
 
@@ -418,6 +420,11 @@ impl<T> PtrConvert<T> for Box<T> {
     fn deref_guard(guard: &Self::GuardVal) -> &Self::GuardDeref {
         unsafe { guard.as_ref() }
     }
+
+    #[inline(always)]
+    fn guard_to_ptr(guard: &Self::GuardVal) -> NonNull<T> {
+        *guard
+    }
 }
 
 impl<T> PtrConvert<T> for Arc<T> {
@@ -442,6 +449,11 @@ impl<T> PtrConvert<T> for Arc<T> {
     #[inline(always)]
     fn deref_guard(guard: &Self::GuardVal) -> &Self::GuardDeref {
         guard.deref()
+    }
+
+    #[inline(always)]
+    fn guard_to_ptr(guard: &Self::GuardVal) -> NonNull<T> {
+        unsafe { NonNull::new_unchecked((guard.as_ref() as *const T).cast_mut()) }
     }
 }
 
