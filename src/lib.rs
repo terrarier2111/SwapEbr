@@ -1,3 +1,4 @@
+#![feature(thread_local)]
 #![cfg_attr(
     feature = "no_std",
     no_std,
@@ -96,17 +97,7 @@ mod standard {
             }
         }
 
-        pub fn store(&self, val: T) {
-            let pin = pin();
-            let old = pin.swap(&self.it, val.into_ptr().as_ptr(), Ordering::AcqRel);
-            unsafe {
-                retire_explicit(NonNull::new_unchecked(old.cast_mut()), cleanup::<T, U>);
-            }
-        }
-    }
-
-    impl<T: PtrConvert<U>, U> Swap<T, U> {
-        pub fn load(&self) -> SwapGuard<T, U, T::GuardDeref> {
+        pub fn load(&self) -> SwapGuard<T, U> {
             let pin = pin();
             SwapGuard {
                 val: T::guard_val(unsafe {
@@ -114,6 +105,14 @@ mod standard {
                 }),
                 _guard: pin,
                 _phantom_data: PhantomData,
+            }
+        }
+
+        pub fn store(&self, val: T) {
+            let pin = pin();
+            let old = pin.swap(&self.it, val.into_ptr().as_ptr(), Ordering::AcqRel);
+            unsafe {
+                retire_explicit(NonNull::new_unchecked(old.cast_mut()), cleanup::<T, U>);
             }
         }
     }
@@ -141,13 +140,13 @@ mod standard {
         }
     }
 
-    pub struct SwapGuard<T: PtrConvert<U>, U, V> {
+    pub struct SwapGuard<T: PtrConvert<U>, U> {
         pub(crate) val: T::GuardVal,
         pub(crate) _guard: LocalPinGuard,
-        pub(crate) _phantom_data: PhantomData<(U, V)>,
+        pub(crate) _phantom_data: PhantomData<U>,
     }
 
-    impl<T: PtrConvert<U>, U> Deref for SwapGuard<T, U, T::GuardDeref> {
+    impl<T: PtrConvert<U>, U> Deref for SwapGuard<T, U> {
         type Target = T::GuardDeref;
 
         #[inline(always)]
@@ -164,8 +163,8 @@ mod standard {
         }
     }*/
 
-    unsafe impl<T: PtrConvert<U>, U, V> Send for SwapGuard<T, U, V> {}
-    unsafe impl<T: PtrConvert<U>, U, V> Sync for SwapGuard<T, U, V> {}
+    unsafe impl<T: PtrConvert<U>, U> Send for SwapGuard<T, U> {}
+    unsafe impl<T: PtrConvert<U>, U> Sync for SwapGuard<T, U> {}
 }
 
 mod standard_option {
@@ -200,6 +199,7 @@ mod standard_option {
             }
         }
 
+        #[inline(always)]
         pub const fn new_empty() -> Self {
             Self {
                 it: Guarded::new(null_mut()),
@@ -207,7 +207,7 @@ mod standard_option {
             }
         }
 
-        pub fn load(&self) -> Option<SwapGuard<T, U, T::GuardDeref>> {
+        pub fn load(&self) -> Option<SwapGuard<T, U>> {
             let pin = pin();
             let ptr = pin.load(&self.it, Ordering::Acquire);
             if ptr.is_null() {
@@ -268,7 +268,7 @@ mod swap_it {
             }
         }
 
-        pub fn load(&self) -> SwapGuard<Box<T>, T, T> {
+        pub fn load(&self) -> SwapGuard<Box<T>, T> {
             self.bx.load()
         }
 
@@ -303,7 +303,14 @@ mod swap_it_option {
             }
         }
 
-        pub fn load(&self) -> Option<SwapGuard<Box<T>, T, T>> {
+        #[inline]
+        pub const fn new_empty() -> Self {
+            Self {
+                bx: SwapBoxOption::new_empty(),
+            }
+        }
+
+        pub fn load(&self) -> Option<SwapGuard<Box<T>, T>> {
             self.bx.load()
         }
 
@@ -327,6 +334,21 @@ mod swap_it_option {
 fn cleanup<T: PtrConvert<U>, U>(ptr: NonNull<U>) {
     let _ = unsafe { T::from_ptr(ptr) };
 }
+
+/*
+#[no_mangle]
+#[inline(never)]
+pub fn test_ebr(src: &SwapArc<u32>) {
+    let l1 = src.load();
+    black_box(l1);
+}
+
+#[no_mangle]
+#[inline(never)]
+pub fn test_swap_arc(src: &SwapArc<u32>) {
+    let l1 = src.load();
+    black_box(l1);
+}*/
 
 // TODO: use this once `const_type_name` got stabilized
 /// We use this count evaluation to store the Some() option count

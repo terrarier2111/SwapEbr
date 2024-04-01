@@ -21,21 +21,9 @@ fn main() {
                 while !started.load(Ordering::Acquire) {
                     spin_loop();
                 }
-                for _ in 0..20000 {
+                for _ in 0..200000 {
                     let l1 = tmp.load();
                     black_box(l1);
-                }
-            }));
-        }
-        for _ in 0..1 {
-            let tmp = tmp.clone();
-            let started = started.clone();
-            threads.push(thread::spawn(move || {
-                while !started.load(Ordering::Acquire) {
-                    spin_loop();
-                }
-                for i in 0..20000 {
-                    tmp.store(Arc::new(i % 7));
                 }
             }));
         }
