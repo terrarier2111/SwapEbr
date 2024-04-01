@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use swap_arc::SwapArc;
+use SwapEbr::SwapArc;
 
 fn main() {
     let mut dur = Duration::default();

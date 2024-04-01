@@ -39,26 +39,23 @@ cfg_if! {
             SyncUnsafeCell::new(null_mut());
 
         #[inline]
-        fn local_ptr() -> *const ConcLinkedListNode<Inner> {
+        fn local_raw_ptr() -> *mut *const ConcLinkedListNode<Inner> {
             let src = LOCAL_INFO.get();
-            unsafe { *src }
+            src
         }
     } else {
         use std::thread_local;
 
-        #[thread_local]
-        static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> = SyncUnsafeCell::new(null_mut());
         // FIXME: are 2 seperate TLS variables actually better than 1 with an associated destructor?
         thread_local! {
-            // static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> = const { SyncUnsafeCell::new(null_mut()) };
+            static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> = const { SyncUnsafeCell::new(null_mut()) };
             static LOCAL_GUARD: LocalGuard = const { LocalGuard };
         }
 
         #[inline]
-        fn local_ptr() -> *const ConcLinkedListNode<Inner> {
-            // let src = LOCAL_INFO.with(|ptr| ptr.get());
-            let src = LOCAL_INFO.get();
-            unsafe { *src }
+        fn local_raw_ptr() -> *mut *const ConcLinkedListNode<Inner> {
+            let src = LOCAL_INFO.with(|ptr| ptr.get());
+            src
         }
     }
 }
@@ -173,6 +170,12 @@ unsafe impl Send for Instance {}
 unsafe impl Sync for Instance {}
 
 #[inline]
+fn local_ptr() -> *const ConcLinkedListNode<Inner> {
+    let src = local_raw_ptr();
+    unsafe { *src }
+}
+
+#[inline]
 fn try_get_local<'a>() -> Option<&'a Inner> {
     unsafe { local_ptr().as_ref().map(|node| node.val()) }
 }
@@ -182,8 +185,7 @@ fn get_local<'a>() -> &'a Inner {
     #[cold]
     #[inline(never)]
     fn alloc_local<'a>() -> &'a Inner {
-        // let src = LOCAL_INFO.with(|ptr| ptr.get());
-        let src = LOCAL_INFO.get();
+        let src = local_raw_ptr();
         unsafe {
             let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner::new())));
             *src = alloc;
@@ -667,6 +669,7 @@ mod conc_linked_list {
         }
     }
 
+    // FIXME: why are we aligning here?
     #[repr(align(4))]
     pub(crate) struct ConcLinkedListNode<T> {
         next: AtomicPtr<ConcLinkedListNode<T>>,
@@ -688,7 +691,7 @@ mod conc_linked_list {
         }
 
         #[inline]
-        pub fn addr_offset() -> usize {
+        pub const fn addr_offset() -> usize {
             offset_of!(Self, val)
         }
     }
