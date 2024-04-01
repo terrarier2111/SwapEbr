@@ -1,6 +1,5 @@
 extern crate criterion;
 
-use aarc::Arc as AArc;
 use aarc::AtomicArc;
 use aarc::Snapshot;
 use arc_swap::ArcSwap;
@@ -208,7 +207,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>();
                             black_box(l1);
                         }
                     }));
@@ -221,7 +220,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            tmp.store(Some(&AArc::new(random())), Ordering::Release);
+                            tmp.store(Some(&Arc::new(random())));
                         }
                     }));
                 }
@@ -406,11 +405,11 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
-                            let l2 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
-                            let l3 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
-                            let l4 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
-                            let l5 = black_box(tmp.load::<Snapshot<i32>>(Ordering::Acquire));
+                            let l1 = black_box(tmp.load::<Snapshot<i32>>());
+                            let l2 = black_box(tmp.load::<Snapshot<i32>>());
+                            let l3 = black_box(tmp.load::<Snapshot<i32>>());
+                            let l4 = black_box(tmp.load::<Snapshot<i32>>());
+                            let l5 = black_box(tmp.load::<Snapshot<i32>>());
                             drop(black_box(l1));
                             drop(black_box(l2));
                             drop(black_box(l3));
@@ -427,7 +426,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            tmp.store(Some(&AArc::new(rand::random())), Ordering::Release);
+                            tmp.store(Some(&Arc::new(rand::random())));
                         }
                     }));
                 }
@@ -622,7 +621,7 @@ fn main() {
                         for _ in 0..20000
                         /*200*/
                         {
-                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>();
                             black_box(l1);
                         }
                     }));
@@ -641,7 +640,7 @@ fn main() {
                         for _ in 0..20000
                         /*200*/
                         {
-                            tmp.store(Some(&AArc::new(rand::random())), Ordering::Release);
+                            tmp.store(Some(&Arc::new(rand::random())));
                         }
                     }));
                 }
@@ -860,11 +859,11 @@ fn main() {
                         for _ in 0..20000
                         /*200*/
                         {
-                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
-                            let l2 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
-                            let l3 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
-                            let l4 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
-                            let l5 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>();
+                            let l2 = tmp.load::<Snapshot<i32>>();
+                            let l3 = tmp.load::<Snapshot<i32>>();
+                            let l4 = tmp.load::<Snapshot<i32>>();
+                            let l5 = tmp.load::<Snapshot<i32>>();
                             black_box(l1);
                             black_box(l2);
                             black_box(l3);
@@ -887,7 +886,7 @@ fn main() {
                         for _ in 0..20000
                         /*200*/
                         {
-                            tmp.store(Some(&AArc::new(rand::random())), Ordering::Release);
+                            tmp.store(Some(&Arc::new(rand::random())));
                         }
                     }));
                 }
@@ -1020,7 +1019,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..200000 {
-                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>();
                             black_box(l1);
                         }
                     }));
@@ -1146,7 +1145,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..200000 {
-                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>();
                             black_box(l1);
                         }
                     }));
@@ -1272,7 +1271,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..200000 {
-                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>();
                             black_box(l1);
                         }
                     }));
@@ -1422,11 +1421,11 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..200000 {
-                            let l1 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
-                            let l2 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
-                            let l3 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
-                            let l4 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
-                            let l5 = tmp.load::<Snapshot<i32>>(Ordering::Acquire);
+                            let l1 = tmp.load::<Snapshot<i32>>();
+                            let l2 = tmp.load::<Snapshot<i32>>();
+                            let l3 = tmp.load::<Snapshot<i32>>();
+                            let l4 = tmp.load::<Snapshot<i32>>();
+                            let l5 = tmp.load::<Snapshot<i32>>();
                             black_box(l1);
                             black_box(l2);
                             black_box(l3);
@@ -1553,7 +1552,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            tmp.store(Some(&AArc::new(random())), Ordering::Release);
+                            tmp.store(Some(&Arc::new(random())));
                         }
                     }));
                 }

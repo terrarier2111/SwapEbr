@@ -19,9 +19,9 @@ dependencies = [
 
 [[package]]
 name = "aarc"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cab962a05288cba482154c7660e9b0543b785a451828e81ed774957848ed9c6"
+checksum = "8d727121305b34ba3e7e8b8a1a79ce95b9f51a2693e7ead747566e2666bfc9fb"
 
 [[package]]
 name = "aho-corasick"
