@@ -10,7 +10,7 @@ use likely_stable::unlikely;
 
 use crate::{
     epoch::conc_linked_list::ConcLinkedListNode,
-    reclamation::{ReclamationMode, LAZY_THRESHOLD, RECLAMATION_MODE},
+    reclamation::{ReclamationMode, ReclamationStrategy, LAZY_THRESHOLD},
 };
 
 use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
@@ -54,8 +54,7 @@ cfg_if! {
 
         #[inline]
         fn local_raw_ptr() -> *mut *const ConcLinkedListNode<Inner> {
-            let src = LOCAL_INFO.with(|ptr| ptr.get());
-            src
+            LOCAL_INFO.with(|ptr| ptr.get())
         }
     }
 }
@@ -205,7 +204,7 @@ fn get_local<'a>() -> &'a Inner {
 
 /// This may not be called if there is already a pin active
 #[inline]
-pub(crate) fn pin() -> LocalPinGuard {
+pub(crate) fn pin<R: ReclamationStrategy>() -> LocalPinGuard {
     let local_info = get_local();
     // this is relaxed as we know that we are the only thread currently to modify any local data
     let active = local_info.active_local.load(Ordering::Relaxed);
@@ -216,7 +215,7 @@ pub(crate) fn pin() -> LocalPinGuard {
     let update_epoch = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
     let local = local_info.epoch.load(Ordering::Relaxed);
     if update_epoch > local {
-        update_local(local_info);
+        update_local::<R>(local_info);
     }
     LocalPinGuard(local_info as *const Inner)
 }
@@ -269,12 +268,12 @@ fn increment_update_epoch() -> usize {
 
 #[cold]
 #[inline(never)]
-fn update_local(local_info: &Inner) {
+fn update_local<R: ReclamationStrategy>(local_info: &Inner) {
     // update epoch
     let new = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
     local_info.epoch.store(new, Ordering::Release);
 
-    match RECLAMATION_MODE {
+    match R::mode() {
         ReclamationMode::Eager => {
             try_cleanup(local_info, new);
         }
@@ -390,7 +389,10 @@ const LOCAL_DESTROYED: usize = 1 << (usize::BITS - 1);
 
 // #[inline(never)]
 #[inline]
-pub(crate) unsafe fn retire_explicit<T>(val: NonNull<T>, cleanup: fn(NonNull<T>)) {
+pub(crate) unsafe fn retire_explicit<T, R: ReclamationStrategy>(
+    val: NonNull<T>,
+    cleanup: fn(NonNull<T>),
+) {
     let local = get_local();
     let old = unsafe {
         (*local.pile.get()).try_push_back(Instance::new_explicit(
@@ -405,7 +407,7 @@ pub(crate) unsafe fn retire_explicit<T>(val: NonNull<T>, cleanup: fn(NonNull<T>)
     }
     let new_epoch = increment_update_epoch();
     local.epoch.store(new_epoch, Ordering::Release);
-    match RECLAMATION_MODE {
+    match R::mode() {
         ReclamationMode::Eager => {
             try_cleanup(local, new_epoch);
         }
@@ -425,10 +427,10 @@ pub(crate) unsafe fn retire_explicit<T>(val: NonNull<T>, cleanup: fn(NonNull<T>)
 }
 
 #[allow(dead_code)]
-pub(crate) unsafe fn retire<T>(val: NonNull<T>) {
+pub(crate) unsafe fn retire<T, R: ReclamationStrategy>(val: NonNull<T>) {
     let drop_fn = drop_in_place::<T> as *const ();
     let drop_fn = unsafe { transmute(drop_fn) };
-    retire_explicit(val, drop_fn);
+    retire_explicit::<T, R>(val, drop_fn);
 }
 
 pub struct LocalPinGuard(*const Inner);
@@ -855,7 +857,10 @@ mod test {
     use std::sync::Arc;
     use std::thread;
 
-    use crate::epoch::{self, retire_explicit, Guarded};
+    use crate::{
+        epoch::{self, retire_explicit, Guarded},
+        reclamation::Balanced,
+    };
 
     #[test]
     fn load_multi() {
@@ -868,19 +873,22 @@ mod test {
 
         let initial = Box::new("test".to_string());
         let guard = Arc::new(Guarded::new(Box::into_raw(initial)));
-        let pin = epoch::pin();
+        let pin = epoch::pin::<Balanced>();
         let pinned = pin.load(&guard, Ordering::Acquire);
         println!("pinned: {}", unsafe { &*pinned });
         let move_guard = guard.clone();
         let other = thread::spawn(move || {
             let guard = move_guard;
-            let pin = epoch::pin();
+            let pin = epoch::pin::<Balanced>();
             for i in 0..100 {
                 let i = 100 + i;
                 let curr = Box::new(format!("test{i}"));
                 let prev = pin.swap(&guard, Box::into_raw(curr), Ordering::AcqRel);
                 unsafe {
-                    retire_explicit(NonNull::new(prev.cast_mut()).unwrap(), cleanup_fn);
+                    retire_explicit::<String, Balanced>(
+                        NonNull::new(prev.cast_mut()).unwrap(),
+                        cleanup_fn,
+                    );
                 }
             }
             println!("finished2");
@@ -889,14 +897,17 @@ mod test {
             let curr = Box::new(format!("test{i}"));
             let prev = pin.swap(&guard, Box::into_raw(curr), Ordering::AcqRel);
             unsafe {
-                retire_explicit(NonNull::new(prev.cast_mut()).unwrap(), cleanup_fn);
+                retire_explicit::<String, Balanced>(
+                    NonNull::new(prev.cast_mut()).unwrap(),
+                    cleanup_fn,
+                );
             }
         }
         println!("finished1");
 
         other.join().unwrap();
         unsafe {
-            retire_explicit(
+            retire_explicit::<String, Balanced>(
                 NonNull::new(pin.load(&guard, Ordering::Acquire).cast_mut()).unwrap(),
                 cleanup_fn,
             );

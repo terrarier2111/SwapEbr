@@ -39,6 +39,52 @@ pub fn new_unsized<T: ?Sized>(val: Box<T>) -> Swap<Box<Box<T>>, Box<T>> {
 pub(crate) mod reclamation {
     use crate::epoch::LOCAL_PILE_SIZE;
 
+    pub trait ReclamationStrategy: IntoReclamationMode {}
+
+    pub(crate) trait IntoReclamationMode {
+        fn mode() -> ReclamationMode;
+    }
+
+    impl<T: IntoReclamationMode> ReclamationStrategy for T {}
+
+    pub struct Eager;
+
+    impl IntoReclamationMode for Eager {
+        #[inline(always)]
+        fn mode() -> ReclamationMode {
+            ReclamationMode::Eager
+        }
+    }
+
+    pub struct Threshold<const THRESHOLD: usize>;
+
+    impl<const THRESHOLD: usize> IntoReclamationMode for Threshold<THRESHOLD> {
+        #[inline(always)]
+        fn mode() -> ReclamationMode {
+            ReclamationMode::Threshold {
+                threshold: THRESHOLD,
+            }
+        }
+    }
+
+    pub struct Lazy;
+
+    impl IntoReclamationMode for Lazy {
+        #[inline(always)]
+        fn mode() -> ReclamationMode {
+            ReclamationMode::Lazy
+        }
+    }
+
+    pub struct Balanced;
+
+    impl IntoReclamationMode for Balanced {
+        #[inline(always)]
+        fn mode() -> ReclamationMode {
+            ReclamationMode::Balanced
+        }
+    }
+
     // TODO: expose this once adt_const_params got stabilized
     #[allow(dead_code)]
     pub(crate) enum ReclamationMode {
@@ -69,7 +115,6 @@ pub(crate) mod reclamation {
         };
     }
 
-    pub(crate) const RECLAMATION_MODE: ReclamationMode = ReclamationMode::Balanced;
     pub(crate) const LAZY_THRESHOLD: usize = LOCAL_PILE_SIZE;
 }
 
@@ -79,15 +124,16 @@ mod standard {
     use crate::{
         cleanup,
         epoch::{pin, retire_explicit, Guarded, LocalPinGuard},
+        reclamation::{Balanced, ReclamationStrategy},
         PtrConvert,
     };
 
-    pub struct Swap<T: PtrConvert<U>, U> {
+    pub struct Swap<T: PtrConvert<U>, U, R: ReclamationStrategy = Balanced> {
         pub(crate) it: Guarded<U>,
-        _phantom_data: PhantomData<T>,
+        _phantom_data: PhantomData<(T, R)>,
     }
 
-    impl<T: PtrConvert<U>, U> Swap<T, U> {
+    impl<T: PtrConvert<U>, U, R: ReclamationStrategy> Swap<T, U, R> {
         #[inline]
         pub fn new(val: T) -> Self {
             Self {
@@ -97,7 +143,7 @@ mod standard {
         }
 
         pub fn load(&self) -> SwapGuard<T, U> {
-            let pin = pin();
+            let pin = pin::<R>();
             SwapGuard {
                 val: T::guard_val(unsafe {
                     NonNull::new_unchecked(pin.load(&self.it, Ordering::Acquire).cast_mut())
@@ -108,10 +154,10 @@ mod standard {
         }
 
         pub fn store(&self, val: T) {
-            let pin = pin();
+            let pin = pin::<R>();
             let old = pin.swap(&self.it, val.into_ptr().as_ptr(), Ordering::AcqRel);
             unsafe {
-                retire_explicit(NonNull::new_unchecked(old.cast_mut()), cleanup::<T, U>);
+                retire_explicit::<U, R>(NonNull::new_unchecked(old.cast_mut()), cleanup::<T, U>);
             }
         }
     }
@@ -139,11 +185,11 @@ mod standard {
         }
     }
 
-    impl<T: PtrConvert<U>, U> Drop for Swap<T, U> {
+    impl<T: PtrConvert<U>, U, R: ReclamationStrategy> Drop for Swap<T, U, R> {
         fn drop(&mut self) {
-            let pin = pin();
+            let pin = pin::<R>();
             unsafe {
-                retire_explicit(
+                retire_explicit::<U, R>(
                     NonNull::new_unchecked(pin.load(&self.it, Ordering::Acquire).cast_mut()),
                     cleanup::<T, U>,
                 );
@@ -188,16 +234,17 @@ mod standard_option {
     use crate::{
         cleanup,
         epoch::{pin, retire_explicit, Guarded},
+        reclamation::{Balanced, ReclamationStrategy},
         standard::SwapGuard,
         PtrConvert,
     };
 
-    pub struct SwapOption<T: PtrConvert<U>, U> {
+    pub struct SwapOption<T: PtrConvert<U>, U, R: ReclamationStrategy = Balanced> {
         pub(crate) it: Guarded<U>,
-        _phantom_data: PhantomData<T>,
+        _phantom_data: PhantomData<(T, R)>,
     }
 
-    impl<T: PtrConvert<U>, U> SwapOption<T, U> {
+    impl<T: PtrConvert<U>, U, R: ReclamationStrategy> SwapOption<T, U, R> {
         #[inline]
         pub fn new(val: Option<T>) -> Self {
             let ptr = match val {
@@ -219,7 +266,7 @@ mod standard_option {
         }
 
         pub fn load(&self) -> Option<SwapGuard<T, U>> {
-            let pin = pin();
+            let pin = pin::<R>();
             let ptr = pin.load(&self.it, Ordering::Acquire);
             if ptr.is_null() {
                 return None;
@@ -233,14 +280,14 @@ mod standard_option {
 
         pub fn store(&self, val: T) {
             let ptr = val.into_ptr();
-            let pin = pin();
+            let pin = pin::<R>();
             let old = pin.swap(&self.it, ptr.as_ptr(), Ordering::AcqRel);
             if old.is_null() {
                 // don't cleanup inexistant values
                 return;
             }
             unsafe {
-                retire_explicit(NonNull::new_unchecked(old.cast_mut()), cleanup::<T, U>);
+                retire_explicit::<U, R>(NonNull::new_unchecked(old.cast_mut()), cleanup::<T, U>);
             }
         }
     }
@@ -264,15 +311,15 @@ mod standard_option {
         }
     }
 
-    impl<T: PtrConvert<U>, U> Drop for SwapOption<T, U> {
+    impl<T: PtrConvert<U>, U, R: ReclamationStrategy> Drop for SwapOption<T, U, R> {
         fn drop(&mut self) {
-            let pin = pin();
+            let pin = pin::<R>();
             let ptr = pin.load(&self.it, Ordering::Acquire).cast_mut();
             if ptr.is_null() {
                 return;
             }
             unsafe {
-                retire_explicit(NonNull::new_unchecked(ptr), cleanup::<T, U>);
+                retire_explicit::<U, R>(NonNull::new_unchecked(ptr), cleanup::<T, U>);
             }
         }
     }
