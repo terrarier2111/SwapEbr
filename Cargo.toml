@@ -31,9 +31,9 @@ rand = "0.8"
 name = "swap_ebr"
 harness = false
 
-[profile.release]
-debug = true
+# [profile.release]
+# debug = true
 
-[target.x86_64-unknown-linux-gnu]
-linker = "/usr/bin/clang"
-rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
+# [target.x86_64-unknown-linux-gnu]
+# linker = "/usr/bin/clang"
+# rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]

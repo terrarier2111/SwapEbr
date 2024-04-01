@@ -5,12 +5,14 @@ use std::{
         Arc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
-use SwapEbr::SwapIt;
+use swap_arc::SwapArc;
 
 fn main() {
-    let tmp = Arc::new(SwapIt::new(Arc::new(0)));
+    let mut dur = Duration::default();
+    let tmp = Arc::new(SwapArc::new(Arc::new(0)));
     for _ in 0..1000 {
         let started = Arc::new(AtomicBool::new(false));
         let mut threads = vec![];
@@ -28,8 +30,11 @@ fn main() {
             }));
         }
         started.store(true, Ordering::Release);
+        let start = Instant::now();
         threads
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
+        dur += Instant::now().duration_since(start);
     }
+    println!("dur: {}", dur.as_millis());
 }

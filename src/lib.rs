@@ -89,7 +89,7 @@ mod standard {
     }
 
     impl<T: PtrConvert<U>, U> Swap<T, U> {
-        #[inline(always)]
+        #[inline]
         pub fn new(val: T) -> Self {
             Self {
                 it: Guarded::new(T::into_ptr(val).as_ptr()),
@@ -136,6 +136,18 @@ mod standard {
                     Ok(())
                 }
                 Err(val) => Err((unsafe { T::from_ptr(new_ptr) }, val)),
+            }
+        }
+    }
+
+    impl<T: PtrConvert<U>, U> Drop for Swap<T, U> {
+        fn drop(&mut self) {
+            let pin = pin();
+            unsafe {
+                retire_explicit(
+                    NonNull::new_unchecked(pin.load(&self.it, Ordering::Acquire).cast_mut()),
+                    cleanup::<T, U>,
+                );
             }
         }
     }
@@ -187,7 +199,7 @@ mod standard_option {
     }
 
     impl<T: PtrConvert<U>, U> SwapOption<T, U> {
-        #[inline(always)]
+        #[inline]
         pub fn new(val: Option<T>) -> Self {
             let ptr = match val {
                 Some(val) => val.into_ptr().as_ptr(),
@@ -249,6 +261,19 @@ mod standard_option {
                     Ok(())
                 }
                 Err(val) => Err(val),
+            }
+        }
+    }
+
+    impl<T: PtrConvert<U>, U> Drop for SwapOption<T, U> {
+        fn drop(&mut self) {
+            let pin = pin();
+            let ptr = pin.load(&self.it, Ordering::Acquire).cast_mut();
+            if ptr.is_null() {
+                return;
+            }
+            unsafe {
+                retire_explicit(NonNull::new_unchecked(ptr), cleanup::<T, U>);
             }
         }
     }
@@ -334,21 +359,6 @@ mod swap_it_option {
 fn cleanup<T: PtrConvert<U>, U>(ptr: NonNull<U>) {
     let _ = unsafe { T::from_ptr(ptr) };
 }
-
-/*
-#[no_mangle]
-#[inline(never)]
-pub fn test_ebr(src: &SwapArc<u32>) {
-    let l1 = src.load();
-    black_box(l1);
-}
-
-#[no_mangle]
-#[inline(never)]
-pub fn test_swap_arc(src: &SwapArc<u32>) {
-    let l1 = src.load();
-    black_box(l1);
-}*/
 
 // TODO: use this once `const_type_name` got stabilized
 /// We use this count evaluation to store the Some() option count
