@@ -16,17 +16,23 @@ use crate::{
 use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
 
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
-    pile: CachePadded::new(ConcLinkedList::new()),
-    locals: CachePadded::new(ConcLinkedList::new()),
+    cold: CachePadded::new(ColdGlobals {
+        pile: ConcLinkedList::new(),
+        locals: ConcLinkedList::new(),
+    }),
     update_epoch: AtomicUsize::new(0),
     min_safe_epoch: AtomicUsize::new(0),
 };
 
 struct GlobalInfo {
-    pile: CachePadded<ConcLinkedList<Instance>>,
-    locals: CachePadded<ConcLinkedList<Inner>>, // FIXME: cache reusable locals
+    cold: CachePadded<ColdGlobals>,
     update_epoch: AtomicUsize,
     min_safe_epoch: AtomicUsize,
+}
+
+struct ColdGlobals {
+    pile: ConcLinkedList<Instance>,
+    locals: ConcLinkedList<Inner>, // FIXME: cache reusable locals
 }
 
 cfg_if! {
@@ -112,7 +118,7 @@ fn destroy_local(local: &Inner) {
             }
         } else {
             // push garbage onto pile
-            GLOBAL_INFO.pile.push_front(garbage.clone());
+            GLOBAL_INFO.cold.pile.push_front(garbage.clone());
         }
     }
     if local.active_shared.load(Ordering::Acquire) == local.active_local.load(Ordering::Acquire) {
@@ -121,6 +127,7 @@ fn destroy_local(local: &Inner) {
             // there are no more external references, so local can be cleaned up immediately
             // FIXME: don't iterate the whole list but only check a single entry (and store said entry in the local itself)
             if GLOBAL_INFO
+                .cold
                 .locals
                 .try_drain(|curr| curr as *const _ == local)
             {
@@ -188,7 +195,7 @@ fn get_local<'a>() -> &'a Inner {
         unsafe {
             let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner::new())));
             *src = alloc;
-            GLOBAL_INFO.locals.push_front_optimistic(alloc);
+            GLOBAL_INFO.cold.locals.push_front_optimistic(alloc);
             #[cfg(not(feature = "no_std"))]
             LOCAL_GUARD.with(|_| {});
             (*alloc).val()
@@ -310,7 +317,7 @@ fn try_cleanup(local_info: &Inner, update_epoch: usize) {
         rem
     });
     // try cleanup global
-    GLOBAL_INFO.pile.try_drain(|val| {
+    GLOBAL_INFO.cold.pile.try_drain(|val| {
         let remove = val.epoch < min_safe;
         if remove {
             unsafe {
@@ -325,7 +332,7 @@ fn try_cleanup(local_info: &Inner, update_epoch: usize) {
         return;
     }
     let mut min_used = usize::MAX;
-    GLOBAL_INFO.locals.try_drain(|local| {
+    GLOBAL_INFO.cold.locals.try_drain(|local| {
         let local_epoch = local.epoch.load(Ordering::Acquire);
         #[cfg(feature = "no_std")]
         if unsafe { libc::pthread_kill(local.origin_thread, 0) } == ESRCH {
@@ -403,7 +410,7 @@ pub(crate) unsafe fn retire_explicit<T, R: ReclamationStrategy>(
     };
     if let Some(old) = old {
         // there is no more space in the local pile, try letting global handle our old garbage instead
-        GLOBAL_INFO.pile.push_front(old);
+        GLOBAL_INFO.cold.pile.push_front(old);
     }
     let new_epoch = increment_update_epoch();
     local.epoch.store(new_epoch, Ordering::Release);
