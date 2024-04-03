@@ -429,22 +429,42 @@ fn cleanup<T: PtrConvert<U>, U>(ptr: NonNull<U>) {
     layers
 }*/
 
-pub trait PtrConvert<T: ?Sized>: Sized {
+/// This trait allow types to be used as the storage type in `Swap`.
+///
+/// ### Safety:
+/// Note that this trait is only safe to implement if all of its invariants
+/// are respected by the implementation.
+/// Furthermore types implementing this trait should deallocate their backing storage
+/// only when Drop is called.
+pub unsafe trait PtrConvert<T: ?Sized>: Sized {
     type GuardVal;
     type GuardDeref;
 
+    /// Converts `ptr` into its corresponding instance of `Self`
+    ///
+    /// ### Safety:
+    /// `ptr` has to be acquired through `Self::into_ptr`
     unsafe fn from_ptr(ptr: NonNull<T>) -> Self;
 
+    /// Converts `self` into a pointer to the value it holds without
+    /// deallocating the backing memory
     fn into_ptr(self) -> NonNull<T>;
 
+    /// Converts a pointer to the value being held into a value stored
+    /// inside the guard that's given out on `load` calls.
+    /// Note that this value should not deallocate the backing memory on drop.
     fn guard_val(ptr: NonNull<T>) -> Self::GuardVal;
 
+    /// Acquires a pointer to the stored value through the guard
+    /// thats stored inside `SwapGuard` on `load` calls.
     fn guard_to_ptr(guard: &Self::GuardVal) -> NonNull<T>;
 
+    /// Acquires a reference to `Self::GuardDeref` through the guard
+    /// thats stored inside `SwapGuard` on `load` calls.
     fn deref_guard(guard: &Self::GuardVal) -> &Self::GuardDeref;
 }
 
-impl<T> PtrConvert<T> for Box<T> {
+unsafe impl<T> PtrConvert<T> for Box<T> {
     type GuardVal = NonNull<T>;
     type GuardDeref = T;
 
@@ -474,7 +494,7 @@ impl<T> PtrConvert<T> for Box<T> {
     }
 }
 
-impl<T> PtrConvert<T> for Arc<T> {
+unsafe impl<T> PtrConvert<T> for Arc<T> {
     type GuardVal = ManuallyDrop<Arc<T>>;
     type GuardDeref = Arc<T>;
 
