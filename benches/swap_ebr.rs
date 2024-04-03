@@ -17,6 +17,8 @@ use SwapEbr::SwapArc as SwapIt;
 
 // NOTE: AArc seems to leak memory so comparing against it is a bit dangerous and can quickly lead to crashes
 
+// FIXME: fix duplicated tests!
+
 fn main() {
     let mut c = Criterion::default().configure_from_args();
 
@@ -64,7 +66,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_read_heavy_single", |b| {
+    c.bench_function("swap_ebr_read_single_write_none_many", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -89,7 +91,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_read_heavy_single", |b| {
+    c.bench_function("swap_arc_read_single_write_none_many", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -114,7 +116,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_read_heavy_single", |b| {
+    c.bench_function("arc_swap_read_single_write_none_many", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -139,7 +141,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_read_heavy_single", |b| {
+    c.bench_function("aarc_read_single_write_none_many", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -166,7 +168,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_read_light_multi", |b| {
+    c.bench_function("swap_ebr_read_multi_write_none_one", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -183,7 +185,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_read_light_multi", |b| {
+    c.bench_function("swap_arc_read_multi_write_none_one", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -200,7 +202,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_read_light_multi", |b| {
+    c.bench_function("arc_swap_read_multi_write_none_one", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -217,7 +219,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_read_light_multi", |b| {
+    c.bench_function("aarc_read_multi_write_none_one", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -239,7 +241,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_read_light_multi", |b| {
+    c.bench_function("swap_ebr_read_multi_write_single_one", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -250,13 +252,17 @@ fn main() {
                         black_box(l1);
                     }
                 })),
-                None,
+                Some(Operation::new(1, |tmp: Arc<SwapIt<i32>>| {
+                    for _ in 0..20000 {
+                        tmp.store(Arc::new(random()));
+                    }
+                })),
                 tmp.clone(),
             )
         });
     });
 
-    c.bench_function("swap_arc_read_light_multi", |b| {
+    c.bench_function("swap_arc_read_multi_write_single_one", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -267,13 +273,17 @@ fn main() {
                         black_box(l1);
                     }
                 })),
-                None,
+                Some(Operation::new(1, |tmp: Arc<SwapArc<i32>>| {
+                    for _ in 0..20000 {
+                        tmp.store(Arc::new(random()));
+                    }
+                })),
                 tmp.clone(),
             )
         });
     });
 
-    c.bench_function("arc_swap_read_light_multi", |b| {
+    c.bench_function("arc_swap_read_multi_write_single_one", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -284,13 +294,17 @@ fn main() {
                         black_box(l1);
                     }
                 })),
-                None,
+                Some(Operation::new(1, |tmp: Arc<ArcSwap<i32>>| {
+                    for _ in 0..20000 {
+                        tmp.store(Arc::new(random()));
+                    }
+                })),
                 tmp.clone(),
             )
         });
     });
 
-    c.bench_function("aarc_read_light_multi", |b| {
+    c.bench_function("aarc_read_read_multi_write_single_one", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -304,7 +318,11 @@ fn main() {
                         }
                     },
                 )),
-                None,
+                Some(Operation::new(1, |tmp: Arc<AtomicArc<i32>>| {
+                    for _ in 0..20000 {
+                        tmp.store(Some(&Arc::new(random())));
+                    }
+                })),
                 tmp.clone(),
             )
         });
@@ -312,7 +330,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_read_heavy_multi", |b| {
+    c.bench_function("swap_ebr_read_multi_write_none_many", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -337,7 +355,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_read_heavy_multi", |b| {
+    c.bench_function("swap_arc_read_multi_write_none_many", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -362,7 +380,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_read_heavy_multi", |b| {
+    c.bench_function("arc_swap_read_multi_write_none_many", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -387,7 +405,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_read_heavy_multi", |b| {
+    c.bench_function("aarc_read_multi_write_none_many", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -417,7 +435,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_multi_single", |b| {
+    c.bench_function("swap_ebr_read_single_write_single_one", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -440,7 +458,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_multi_single", |b| {
+    c.bench_function("swap_arc_read_single_write_single_one", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -463,7 +481,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_multi_single", |b| {
+    c.bench_function("arc_swap_read_single_write_single_one", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -486,7 +504,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_multi_single", |b| {
+    c.bench_function("aarc_read_single_write_single_one", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -511,7 +529,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_single_multi", |b| {
+    c.bench_function("swap_ebr_read_single_write_single_many", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -542,7 +560,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_single_multi", |b| {
+    c.bench_function("swap_arc_read_single_write_single_many", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -573,7 +591,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_single_multi", |b| {
+    c.bench_function("arc_swap_read_single_write_single_many", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -604,7 +622,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_single_multi", |b| {
+    c.bench_function("aarc_read_single_write_single_many", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -637,7 +655,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_multi_single", |b| {
+    c.bench_function("swap_ebr_read_multi_write_multi_one", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -660,7 +678,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_multi_single", |b| {
+    c.bench_function("swap_arc_read_multi_write_multi_one", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -683,7 +701,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_multi_single", |b| {
+    c.bench_function("arc_swap_read_multi_write_multi_one", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -706,7 +724,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_multi_single", |b| {
+    c.bench_function("aarc_read_multi_write_multi_one", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -737,7 +755,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_multi_multi", |b| {
+    c.bench_function("swap_ebr_read_multi_write_multi_many", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -768,7 +786,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_multi_multi", |b| {
+    c.bench_function("swap_arc_read_multi_write_multi_many", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -799,7 +817,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_multi_multi", |b| {
+    c.bench_function("arc_swap_read_multi_write_multi_many", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -830,7 +848,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_multi_multi", |b| {
+    c.bench_function("aarc_read_multi_write_multi_many", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -869,7 +887,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_update_single", |b| {
+    c.bench_function("swap_ebr_read_none_write_single_one", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -885,7 +903,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_update_single", |b| {
+    c.bench_function("swap_arc_read_none_write_single_one", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -901,7 +919,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_update_single", |b| {
+    c.bench_function("arc_swap_read_none_write_single_one", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -917,7 +935,7 @@ fn main() {
         });
     });
 
-    c.bench_function("aarc_update_single", |b| {
+    c.bench_function("aarc_read_none_write_single_one", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
         b.iter_custom(|iters| {
             measure(
@@ -935,7 +953,7 @@ fn main() {
 
     // ---
 
-    c.bench_function("swap_ebr_update_multi", |b| {
+    c.bench_function("swap_ebr_read_none_write_multi_one", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -951,7 +969,7 @@ fn main() {
         });
     });
 
-    c.bench_function("swap_arc_update_multi", |b| {
+    c.bench_function("swap_arc_read_none_write_multi_one", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
@@ -967,7 +985,7 @@ fn main() {
         });
     });
 
-    c.bench_function("arc_swap_update_multi", |b| {
+    c.bench_function("arc_swap_read_none_write_multi_one", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
         b.iter_custom(|iters| {
             measure(
