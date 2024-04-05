@@ -128,12 +128,19 @@ mod standard {
         PtrConvert,
     };
 
+    /// The central structure allowing for data to be loaded very efficiently
+    /// but also allows for data to be stored if necessary
+    /// `T` describes the backing memory in which values of `U` will be stored.
+    /// `U` describes the actual value that can be accessed through the guard.
+    /// `R` describes the strategy to decide at which points in time
+    /// attempts to reclaim garbage should be made.
     pub struct Swap<T: PtrConvert<U>, U, R: ReclamationStrategy = Balanced> {
-        pub(crate) it: Guarded<U>,
+        it: Guarded<U>,
         _phantom_data: PhantomData<(T, R)>,
     }
 
     impl<T: PtrConvert<U>, U, R: ReclamationStrategy> Swap<T, U, R> {
+        /// Creates a new instance of `Swap` with the value `val`
         #[inline]
         pub fn new(val: T) -> Self {
             Self {
@@ -142,6 +149,8 @@ mod standard {
             }
         }
 
+        /// Returns a guard that dereferences to `<T as PtrConvert::<U>>::PtrDeref`
+        /// which can be converted into `&U`.
         pub fn load(&self) -> SwapGuard<T, U> {
             let pin = pin::<R>();
             SwapGuard {
@@ -153,6 +162,7 @@ mod standard {
             }
         }
 
+        /// Swaps the current value with `val`
         pub fn store(&self, val: T) {
             let pin = pin::<R>();
             let old = pin.swap(&self.it, val.into_ptr().as_ptr(), Ordering::AcqRel);
@@ -240,7 +250,7 @@ mod standard_option {
     };
 
     pub struct SwapOption<T: PtrConvert<U>, U, R: ReclamationStrategy = Balanced> {
-        pub(crate) it: Guarded<U>,
+        it: Guarded<U>,
         _phantom_data: PhantomData<(T, R)>,
     }
 
@@ -437,7 +447,12 @@ fn cleanup<T: PtrConvert<U>, U>(ptr: NonNull<U>) {
 /// Furthermore types implementing this trait should deallocate their backing storage
 /// only when Drop is called.
 pub unsafe trait PtrConvert<T: ?Sized>: Sized {
+    /// The type that's stored inside guard and gets constructed on `load`.
+    /// This represents only an internal implementation detail and will not
+    /// be exposed in any api beyond this `PtrConvert` implementation.
     type GuardVal;
+    /// The type that the `load` guard can get dereferenced to.
+    /// There should be some way to convert this into `&U`.
     type GuardDeref;
 
     /// Converts `ptr` into its corresponding instance of `Self`
