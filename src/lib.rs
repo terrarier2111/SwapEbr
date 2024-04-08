@@ -249,12 +249,19 @@ mod standard_option {
         PtrConvert,
     };
 
+    /// The central structure allowing for optional data to be loaded very efficiently
+    /// but also allows for data to be stored if necessary
+    /// `T` describes the backing memory in which values of `U` will be stored.
+    /// `U` describes the actual value that can be accessed through the guard.
+    /// `R` describes the strategy to decide at which points in time
+    /// attempts to reclaim garbage should be made.
     pub struct SwapOption<T: PtrConvert<U>, U, R: ReclamationStrategy = Balanced> {
         it: Guarded<U>,
         _phantom_data: PhantomData<(T, R)>,
     }
 
     impl<T: PtrConvert<U>, U, R: ReclamationStrategy> SwapOption<T, U, R> {
+        /// Creates a new instance of `SwapOption` with the value `val`
         #[inline]
         pub fn new(val: Option<T>) -> Self {
             let ptr = match val {
@@ -267,6 +274,7 @@ mod standard_option {
             }
         }
 
+        /// Creates a new, empty instance of `SwapOption`
         #[inline(always)]
         pub const fn new_empty() -> Self {
             Self {
@@ -275,6 +283,8 @@ mod standard_option {
             }
         }
 
+        /// Returns a guard that dereferences to `<T as PtrConvert::<U>>::PtrDeref`
+        /// which can be converted into `&U`.
         pub fn load(&self) -> Option<SwapGuard<T, U>> {
             let pin = pin::<R>();
             let ptr = pin.load(&self.it, Ordering::Acquire);
@@ -288,6 +298,7 @@ mod standard_option {
             })
         }
 
+        /// Swaps the current value with `val`
         pub fn store(&self, val: T) {
             let ptr = val.into_ptr();
             let pin = pin::<R>();
