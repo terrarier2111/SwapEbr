@@ -39,6 +39,7 @@ pub fn new_unsized<T: ?Sized>(val: Box<T>) -> Swap<Box<Box<T>>, Box<T>> {
 pub(crate) mod reclamation {
     use crate::epoch::LOCAL_PILE_SIZE;
 
+    #[allow(private_bounds)]
     pub trait ReclamationStrategy: IntoReclamationMode {}
 
     pub(crate) trait IntoReclamationMode {
@@ -413,8 +414,8 @@ mod swap_it_option {
             }
         }
 
-         /// Loads the current value and returns a guard to it that dereferences to `T`
-         /// if the value is not `None`
+        /// Loads the current value and returns a guard to it that dereferences to `T`
+        /// if the value is not `None`
         pub fn load(&self) -> Option<SwapGuard<Box<T>, T>> {
             self.bx.load()
         }
