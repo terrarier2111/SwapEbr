@@ -349,21 +349,27 @@ mod standard_option {
 mod swap_it {
     use crate::{standard::SwapGuard, SwapBox};
 
+    /// A structure allowing for data to be loaded very efficiently
+    /// but also allows for data to be stored if necessary
+    /// `T` describes the backing memory in which values of `U` will be stored.
     pub struct SwapIt<T> {
         bx: SwapBox<T>,
     }
 
     impl<T> SwapIt<T> {
+        /// Creates a new instance of `SwapIt` with the value `val`
         pub fn new(val: T) -> Self {
             Self {
                 bx: SwapBox::new(Box::new(val)),
             }
         }
 
+        /// Loads the current value and returns a guard to it that dereferences to `T`
         pub fn load(&self) -> SwapGuard<Box<T>, T> {
             self.bx.load()
         }
 
+        /// Swaps the current value with `val`
         pub fn store(&self, val: T) {
             self.bx.store(Box::new(val));
         }
@@ -384,17 +390,22 @@ mod swap_it {
 mod swap_it_option {
     use crate::{standard::SwapGuard, SwapBoxOption};
 
+    /// A structure allowing for optional data to be loaded very efficiently
+    /// but also allows for data to be stored if necessary
+    /// `T` describes the backing memory in which values of `U` will be stored.
     pub struct SwapItOption<T> {
         bx: SwapBoxOption<T>,
     }
 
     impl<T> SwapItOption<T> {
+        /// Creates a new instance of `SwapItOption` with the value `val`
         pub fn new(val: Option<T>) -> Self {
             Self {
                 bx: SwapBoxOption::new(val.map(|val| Box::new(val))),
             }
         }
 
+        /// Creates a new, empty instance of `SwapItOption`
         #[inline]
         pub const fn new_empty() -> Self {
             Self {
@@ -402,10 +413,13 @@ mod swap_it_option {
             }
         }
 
+         /// Loads the current value and returns a guard to it that dereferences to `T`
+         /// if the value is not `None`
         pub fn load(&self) -> Option<SwapGuard<Box<T>, T>> {
             self.bx.load()
         }
 
+        /// Swaps the current value with `val`
         pub fn store(&self, val: T) {
             self.bx.store(Box::new(val));
         }
