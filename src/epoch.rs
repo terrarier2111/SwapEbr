@@ -2,6 +2,7 @@ use cfg_if::cfg_if;
 use core::{
     cell::{Cell, UnsafeCell},
     mem::transmute,
+    num::NonZeroUsize,
     ptr::{drop_in_place, null_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
@@ -67,18 +68,23 @@ cfg_if! {
 
 pub(crate) const LOCAL_PILE_SIZE: usize = 64;
 
+#[inline(always)]
+fn get_tid() -> NonZeroUsize {
+    // FIXME: use the following once the crate gets recognized: thrid::ThrId::get().value()
+    crate::tid::tid_impl()
+}
+
 // FIXME: instead of checking if thread is still alive periodically, instead register a TLS destructor
 // using pthread_key_create
 
 struct Inner {
+    tid: AtomicUsize,
     pile: SyncUnsafeCell<RingBuffer<Instance, LOCAL_PILE_SIZE>>,
     epoch: AtomicUsize,
     active_local: AtomicUsize, // the MSB, if set indicates that this Inner is safe to remove
     active_shared: AtomicUsize,
     // this is used for the threshold and lazy reclamation modes
     action_cnt: Cell<usize>,
-    #[cfg(feature = "no_std")]
-    origin_thread: libc::pthread_t,
 }
 
 impl Inner {
@@ -89,8 +95,7 @@ impl Inner {
             active_local: AtomicUsize::new(0),
             active_shared: AtomicUsize::new(0),
             action_cnt: Cell::new(0),
-            #[cfg(feature = "no_std")]
-            origin_thread: unsafe { libc::pthread_self() },
+            tid: AtomicUsize::new(get_tid().get()),
         }
     }
 }
@@ -109,6 +114,9 @@ impl Drop for LocalGuard {
 }
 
 fn destroy_local(local: &Inner) {
+    // store a sentinel in order to ensure that if our thread id gets reassigned to a new thread
+    // a comparison in the guard's drop function will always fail (as it should)
+    local.tid.store(0, Ordering::Release);
     let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
     for garbage in unsafe { &*local.pile.get() }.iter() {
         if garbage.epoch < min_safe {
@@ -476,26 +484,20 @@ impl Drop for LocalPinGuard {
     #[inline]
     fn drop(&mut self) {
         // reduce local cnt safely even if src thread terminated
+        let inner = unsafe { &*self.0 };
 
-        let local_ptr = unsafe {
-            local_ptr()
-                .byte_add(ConcLinkedListNode::<Inner>::addr_offset())
-                .cast::<Inner>()
-        };
+        let curr_id = get_tid().get();
         // fast path for thread local releases
-        if self.0 == local_ptr {
-            let local = unsafe { &*local_ptr };
-            local.active_local.store(
-                local.active_local.load(Ordering::Relaxed) - 1,
+        if unsafe { &*self.0 }.tid.load(Ordering::Relaxed) == curr_id {
+            inner.active_local.store(
+                inner.active_local.load(Ordering::Relaxed) - 1,
                 Ordering::Release,
             );
             return;
         }
 
         // reduce shared count
-        unsafe { &*self.0 }
-            .active_shared
-            .fetch_sub(1, Ordering::AcqRel);
+        inner.active_shared.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

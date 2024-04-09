@@ -21,6 +21,7 @@ use core::{mem::ManuallyDrop, ops::Deref, ptr::NonNull};
 use cfg_if::cfg_if;
 
 mod epoch;
+mod tid;
 
 pub use standard::Swap;
 pub use standard::SwapGuard;
@@ -33,6 +34,7 @@ pub type SwapArcOption<T> = SwapOption<Arc<T>, T>;
 pub type SwapBox<T> = Swap<Box<T>, T>;
 pub type SwapBoxOption<T> = SwapOption<Box<T>, T>;
 
+// FIXME: use ThinBox once it's available
 pub fn new_unsized<T: ?Sized>(val: Box<T>) -> Swap<Box<Box<T>>, Box<T>> {
     Swap::new(Box::new(val))
 }
