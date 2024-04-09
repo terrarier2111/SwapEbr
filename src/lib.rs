@@ -19,11 +19,12 @@ cfg_if! {
 use core::{mem::ManuallyDrop, ops::Deref, ptr::NonNull};
 
 use cfg_if::cfg_if;
-use standard::Swap;
 
 mod epoch;
 
-use standard_option::SwapOption;
+pub use standard::Swap;
+pub use standard::SwapGuard;
+pub use standard_option::SwapOption;
 pub use swap_it::SwapIt;
 pub use swap_it_option::SwapItOption;
 
@@ -39,6 +40,8 @@ pub fn new_unsized<T: ?Sized>(val: Box<T>) -> Swap<Box<Box<T>>, Box<T>> {
 pub(crate) mod reclamation {
     use crate::epoch::LOCAL_PILE_SIZE;
 
+    /// Describes a reclamation strategy which is used to decide when an attempt to cleanup
+    /// garbage should be made.
     #[allow(private_bounds)]
     pub trait ReclamationStrategy: IntoReclamationMode {}
 
@@ -48,6 +51,7 @@ pub(crate) mod reclamation {
 
     impl<T: IntoReclamationMode> ReclamationStrategy for T {}
 
+    /// See `ReclamationMode::Eager` for more information on this strategy
     pub struct Eager;
 
     impl IntoReclamationMode for Eager {
@@ -57,6 +61,7 @@ pub(crate) mod reclamation {
         }
     }
 
+    /// See `ReclamationMode::Threshold` for more information on this strategy
     pub struct Threshold<const THRESHOLD: usize>;
 
     impl<const THRESHOLD: usize> IntoReclamationMode for Threshold<THRESHOLD> {
@@ -68,6 +73,7 @@ pub(crate) mod reclamation {
         }
     }
 
+    /// See `ReclamationMode::Lazy` for more information on this strategy
     pub struct Lazy;
 
     impl IntoReclamationMode for Lazy {
@@ -77,6 +83,7 @@ pub(crate) mod reclamation {
         }
     }
 
+    /// See `ReclamationMode::Balanced` for more information on this strategy
     pub struct Balanced;
 
     impl IntoReclamationMode for Balanced {
