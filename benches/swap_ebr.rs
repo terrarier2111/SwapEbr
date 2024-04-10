@@ -25,42 +25,60 @@ fn main() {
     // ---
 
     c.bench_function("swap_ebr_con/destruct", |b| {
-        b.iter_custom(|iters| {
-            let start = Instant::now();
-            for _ in 0..iters {
-                let _ = black_box(SwapIt::new(Arc::new(5)));
-            }
-            start.elapsed()
+        b.iter(|| {
+            let _ = black_box(SwapIt::new(Arc::new(5)));
         });
     });
 
     c.bench_function("swap_arc_con/destruct", |b| {
-        b.iter_custom(|iters| {
-            let start = Instant::now();
-            for _ in 0..iters {
-                let _ = black_box(SwapArc::new(Arc::new(5)));
-            }
-            start.elapsed()
+        b.iter(|| {
+            let _ = black_box(SwapArc::new(Arc::new(5)));
         });
     });
 
     c.bench_function("arc_swap_con/destruct", |b| {
-        b.iter_custom(|iters| {
-            let start = Instant::now();
-            for _ in 0..iters {
-                let _ = black_box(ArcSwap::new(Arc::new(5)));
-            }
-            start.elapsed()
+        b.iter(|| {
+            let _ = black_box(ArcSwap::new(Arc::new(5)));
         });
     });
 
     c.bench_function("aarc_con/destruct", |b| {
-        b.iter_custom(|iters| {
-            let start = Instant::now();
-            for _ in 0..iters {
-                let _ = black_box(AtomicArc::new(Some(5)));
-            }
-            start.elapsed()
+        b.iter(|| {
+            let _ = black_box(AtomicArc::new(Some(5)));
+        });
+    });
+
+    // ---
+
+    c.bench_function("swap_ebr_read_single_write_none_one", |b| {
+        let tmp = Arc::new(SwapIt::new(Arc::new(0)));
+        b.iter(|| {
+            let l1 = tmp.load();
+            black_box(drop(black_box(l1)));
+        });
+    });
+
+    c.bench_function("swap_arc_read_single_write_none_one", |b| {
+        let tmp = Arc::new(SwapArc::new(Arc::new(0)));
+        b.iter(|| {
+            let l1 = tmp.load();
+            black_box(drop(black_box(l1)));
+        });
+    });
+
+    c.bench_function("arc_swap_read_single_write_none_one", |b| {
+        let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
+        b.iter(|| {
+            let l1 = tmp.load();
+            black_box(drop(black_box(l1)));
+        });
+    });
+
+    c.bench_function("aarc_read_single_write_none_one", |b| {
+        let tmp = Arc::new(AtomicArc::new(Some(0)));
+        b.iter(|| {
+            let l1 = tmp.load::<Snapshot<i32>>();
+            black_box(drop(black_box(l1)));
         });
     });
 
@@ -68,101 +86,65 @@ fn main() {
 
     c.bench_function("swap_ebr_read_single_write_none_many", |b| {
         let tmp = Arc::new(SwapIt::new(Arc::new(0)));
-        b.iter_custom(|iters| {
-            measure(
-                iters,
-                Some(Operation::new(1, |tmp: Arc<SwapIt<i32>>| {
-                    for _ in 0..200000 {
-                        let l1 = tmp.load();
-                        let l2 = tmp.load();
-                        let l3 = tmp.load();
-                        let l4 = tmp.load();
-                        let l5 = tmp.load();
-                        black_box(l1);
-                        black_box(l2);
-                        black_box(l3);
-                        black_box(l4);
-                        black_box(l5);
-                    }
-                })),
-                None,
-                tmp.clone(),
-            )
+        b.iter(|| {
+            let l1 = tmp.load();
+            let l2 = tmp.load();
+            let l3 = tmp.load();
+            let l4 = tmp.load();
+            let l5 = tmp.load();
+            black_box(drop(black_box(l1)));
+            black_box(drop(black_box(l2)));
+            black_box(drop(black_box(l3)));
+            black_box(drop(black_box(l4)));
+            black_box(drop(black_box(l5)));
         });
     });
 
     c.bench_function("swap_arc_read_single_write_none_many", |b| {
         let tmp = Arc::new(SwapArc::new(Arc::new(0)));
-        b.iter_custom(|iters| {
-            measure(
-                iters,
-                Some(Operation::new(1, |tmp: Arc<SwapArc<i32>>| {
-                    for _ in 0..200000 {
-                        let l1 = tmp.load();
-                        let l2 = tmp.load();
-                        let l3 = tmp.load();
-                        let l4 = tmp.load();
-                        let l5 = tmp.load();
-                        black_box(l1);
-                        black_box(l2);
-                        black_box(l3);
-                        black_box(l4);
-                        black_box(l5);
-                    }
-                })),
-                None,
-                tmp.clone(),
-            )
+        b.iter(|| {
+            let l1 = tmp.load();
+            let l2 = tmp.load();
+            let l3 = tmp.load();
+            let l4 = tmp.load();
+            let l5 = tmp.load();
+            black_box(drop(black_box(l1)));
+            black_box(drop(black_box(l2)));
+            black_box(drop(black_box(l3)));
+            black_box(drop(black_box(l4)));
+            black_box(drop(black_box(l5)));
         });
     });
 
     c.bench_function("arc_swap_read_single_write_none_many", |b| {
         let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
-        b.iter_custom(|iters| {
-            measure(
-                iters,
-                Some(Operation::new(1, |tmp: Arc<ArcSwap<i32>>| {
-                    for _ in 0..200000 {
-                        let l1 = tmp.load();
-                        let l2 = tmp.load();
-                        let l3 = tmp.load();
-                        let l4 = tmp.load();
-                        let l5 = tmp.load();
-                        black_box(l1);
-                        black_box(l2);
-                        black_box(l3);
-                        black_box(l4);
-                        black_box(l5);
-                    }
-                })),
-                None,
-                tmp.clone(),
-            )
+        b.iter(|| {
+            let l1 = tmp.load();
+            let l2 = tmp.load();
+            let l3 = tmp.load();
+            let l4 = tmp.load();
+            let l5 = tmp.load();
+            black_box(drop(black_box(l1)));
+            black_box(drop(black_box(l2)));
+            black_box(drop(black_box(l3)));
+            black_box(drop(black_box(l4)));
+            black_box(drop(black_box(l5)));
         });
     });
 
     c.bench_function("aarc_read_single_write_none_many", |b| {
         let tmp = Arc::new(AtomicArc::new(Some(0)));
-        b.iter_custom(|iters| {
-            measure(
-                iters,
-                Some(Operation::new(1, |tmp: Arc<AtomicArc<i32>>| {
-                    for _ in 0..200000 {
-                        let l1 = tmp.load::<Snapshot<i32>>();
-                        let l2 = tmp.load::<Snapshot<i32>>();
-                        let l3 = tmp.load::<Snapshot<i32>>();
-                        let l4 = tmp.load::<Snapshot<i32>>();
-                        let l5 = tmp.load::<Snapshot<i32>>();
-                        black_box(l1);
-                        black_box(l2);
-                        black_box(l3);
-                        black_box(l4);
-                        black_box(l5);
-                    }
-                })),
-                None,
-                tmp.clone(),
-            )
+        b.iter(|| {
+            let l1 = tmp.load::<Snapshot<i32>>();
+            let l2 = tmp.load::<Snapshot<i32>>();
+            let l3 = tmp.load::<Snapshot<i32>>();
+            let l4 = tmp.load::<Snapshot<i32>>();
+            let l5 = tmp.load::<Snapshot<i32>>();
+            black_box(drop(black_box(l1)));
+            black_box(drop(black_box(l2)));
+            black_box(drop(black_box(l3)));
+            black_box(drop(black_box(l4)));
+            black_box(drop(black_box(l5)));
         });
     });
 

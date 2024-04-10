@@ -486,6 +486,7 @@ impl Drop for LocalPinGuard {
         // reduce local cnt safely even if src thread terminated
         let inner = unsafe { &*self.0 };
 
+        // we use a thread id that's generated through some (hopefully fast means)
         let curr_id = get_tid().get();
         // fast path for thread local releases
         if unsafe { &*self.0 }.tid.load(Ordering::Relaxed) == curr_id {
