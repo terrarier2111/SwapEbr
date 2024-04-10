@@ -21,6 +21,7 @@ use core::{mem::ManuallyDrop, ops::Deref, ptr::NonNull};
 use cfg_if::cfg_if;
 
 mod epoch;
+#[cfg(feature = "asm_thrid")]
 mod tid;
 
 pub use standard::Swap;

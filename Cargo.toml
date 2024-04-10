@@ -9,6 +9,12 @@ edition = "2021"
 # default = ["no_std"]
 no_std = ["libc"]
 ptr_ops = []
+# Normally this shouldn't be required as most of the time LTO is able to
+# optimize the code to be as fast as using assembly directly
+# but for dylibs or targets with bad (or missing) LTO this might provide
+# performance benefits
+asm_thrid = []
+# asm_thrid = ["thrid"]
 
 [dependencies]
 crossbeam-utils = "0.8"
@@ -24,7 +30,7 @@ criterion = "0.5.1"
 swap-arc = { git = "https://github.com/terrarier2111/SwapArc" }
 aarc = "0.2"
 # FIXME: for some reason this currently doesn't work properly, make it work!
-# thrid = { git = "https://github.com/terrarier2111/thrid" }
+# thrid = { git = "https://github.com/terrarier2111/thrid", optional = true }
 
 [test-dependencies]
 rand = "0.8"
