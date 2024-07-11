@@ -310,10 +310,13 @@ mod standard_option {
         }
 
         /// Swaps the current value with `val`
-        pub fn store(&self, val: T) {
-            let ptr = val.into_ptr();
+        pub fn store(&self, val: Option<T>) {
+            let ptr = match val {
+                Some(val) => val.into_ptr().as_ptr(),
+                None => null_mut(),
+            };
             let pin = pin::<R>();
-            let old = pin.swap(&self.it, ptr.as_ptr(), Ordering::AcqRel);
+            let old = pin.swap(&self.it, ptr, Ordering::AcqRel);
             if old.is_null() {
                 // don't cleanup inexistant values
                 return;
@@ -431,8 +434,8 @@ mod swap_it_option {
         }
 
         /// Swaps the current value with `val`
-        pub fn store(&self, val: T) {
-            self.bx.store(Box::new(val));
+        pub fn store(&self, val: Option<T>) {
+            self.bx.store(val.map(|val| Box::new(val)));
         }
     }
 

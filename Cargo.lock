@@ -3,21 +3,6 @@
 version = 3
 
 [[package]]
-name = "SwapEbr"
-version = "0.1.0"
-dependencies = [
- "aarc",
- "arc-swap",
- "cfg-if",
- "criterion",
- "crossbeam-utils",
- "libc",
- "likely_stable",
- "rand",
- "swap-arc",
-]
-
-[[package]]
 name = "aarc"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -549,6 +534,21 @@ dependencies = [
  "crossbeam-utils",
  "likely_stable",
  "thread_local",
+]
+
+[[package]]
+name = "swap_it"
+version = "0.1.0"
+dependencies = [
+ "aarc",
+ "arc-swap",
+ "cfg-if",
+ "criterion",
+ "crossbeam-utils",
+ "libc",
+ "likely_stable",
+ "rand",
+ "swap-arc",
 ]
 
 [[package]]
