@@ -470,7 +470,7 @@ impl LocalPinGuard {
         ptr.0.swap(val.cast_mut(), order)
     }
 
-    #[cfg_attr(not(feature = "ptr_ops"), allow(dead_code))]
+    #[cfg(feature = "ptr_ops")]
     #[inline]
     pub fn compare_exchange<T>(
         &self,
@@ -826,73 +826,6 @@ mod ring_buf {
         }
     }
 }
-
-/*
-mod untyped_vec {
-    use std::{alloc::{alloc, realloc, Layout}, mem::{align_of, size_of}, process::abort, ptr::null_mut};
-
-    pub(crate) struct UntypedVec {
-        ptr: *mut usize,
-        cap: usize,
-        len: usize,
-        curr_idx: usize,
-    }
-
-    impl UntypedVec {
-
-        pub const fn new() -> Self {
-            Self {
-                ptr: null_mut(),
-                cap: 0,
-                len: 0,
-                curr_idx: 0,
-            }
-        }
-
-        #[inline]
-        pub const fn capacity(&self) -> usize {
-            self.cap
-        }
-
-        #[inline]
-        pub const fn len(&self) -> usize {
-            self.len
-        }
-
-        #[inline]
-        pub const fn is_empty(&self) -> bool {
-            self.len == 0
-        }
-
-        const INITIAL_CAP_MUL: usize = 8;
-        const CAP_MUL: usize = 2;
-
-        pub fn push<T>(&mut self, val: T) {
-            let remaining = self.cap - self.curr_idx;
-            let req = size_of::<T>().next_multiple_of(size_of::<usize>() + size_of::<usize>() + align_of::<T>() + size_of::<fn()>()) / size_of::<usize>();
-            if remaining < req {
-                if self.ptr.is_null() {
-                    let alloc = unsafe { alloc(Layout::from_size_align(req * Self::INITIAL_CAP_MUL, size_of::<usize>()).unwrap()) };
-                    if alloc.is_null() {
-                        abort();
-                    }
-                    self.ptr = alloc.cast::<usize>();
-                    self.cap = req * Self::INITIAL_CAP_MUL;
-                } else {
-                    // FIXME: should we try using realloc?
-                    let new_alloc = unsafe { alloc(Layout::array::<usize>(req).unwrap()) }.cast::<usize>();
-                    if new_alloc.is_null() {
-                        abort();
-                    }
-                    unsafe { core::ptr::copy_nonoverlapping(self.ptr, new_alloc, req); }
-                }
-            }
-            self.len += 1;
-            self.curr_idx +=
-        }
-
-    }
-}*/
 
 #[cfg(all(not(feature = "no_std"), test))]
 mod test {
