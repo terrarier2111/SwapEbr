@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use swap_arc::SwapArc;
-use SwapEbr::SwapArc as SwapIt;
+use swap_it::SwapArc as SwapIt;
 
 // NOTE: AArc seems to leak memory so comparing against it is a bit dangerous and can quickly lead to crashes
 
