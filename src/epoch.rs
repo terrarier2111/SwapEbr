@@ -108,9 +108,6 @@ impl Inner {
     }
 }
 
-unsafe impl Send for Inner {}
-unsafe impl Sync for Inner {}
-
 struct LocalGuard;
 
 impl Drop for LocalGuard {
@@ -473,8 +470,7 @@ impl LocalPinGuard {
         ptr.0.swap(val.cast_mut(), order)
     }
 
-    // we need to allow dead code here as if the `ptr_ops` feature is disabled, this function won't be used
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "ptr_ops"), allow(dead_code))]
     #[inline]
     pub fn compare_exchange<T>(
         &self,
@@ -759,7 +755,7 @@ mod ring_buf {
         pub const fn new() -> Self {
             Self {
                 // TODO: use uninit_array instead, once stabilized
-                buf: unsafe { MaybeUninit::<[MaybeUninit<T>; LEN]>::uninit().assume_init() },
+                buf: [const { MaybeUninit::uninit() }; LEN],
                 head: 0,
                 len: 0,
             }
