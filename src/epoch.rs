@@ -246,9 +246,13 @@ fn increment_update_epoch() -> usize {
     #[cold]
     #[inline(never)]
     fn handle_guard_hit(epoch: &mut usize) {
+        // if we hit the looser limit, we can't recover anymore
         if *epoch >= EPOCH_OVERFLOW_GUARD {
             abort();
         }
+        // this condition should always be checked by the caller before calling this function
+        debug_assert!(*epoch >= EPOCH_WRAP_AROUND_GUARD);
+        // if we hit the looser limit, try recovering
         if *epoch >= EPOCH_WRAP_AROUND_GUARD {
             let mut curr = *epoch;
             loop {
@@ -258,16 +262,24 @@ fn increment_update_epoch() -> usize {
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        *epoch -= EPOCH_WRAP_AROUND_GUARD;
+                        return;
+                    }
                     Err(new) => {
                         if new < EPOCH_WRAP_AROUND_GUARD {
-                            break;
+                            let new = GLOBAL_INFO
+                                .update_epoch
+                                .fetch_add(EPOCH_ONE, Ordering::AcqRel)
+                                + EPOCH_ONE;
+                            debug_assert!(new < EPOCH_WRAP_AROUND_GUARD);
+                            *epoch = new;
+                            return;
                         }
                         curr = new;
                     }
                 }
             }
-            *epoch -= EPOCH_WRAP_AROUND_GUARD;
         }
     }
 
@@ -362,9 +374,9 @@ fn try_cleanup(local_info: &Inner, update_epoch: usize) {
         if outdated {
             // the order in which these two loads happen in the comparison is very important!
             // we first load active_shared as it may only ever grow and never shrink and then active_local which may both grow and shrink (but never below active_shared)
-            // this means that after loading active_shared even is active_local gets decremented as much as it can it could only ever lead to either matching
+            // this means that after loading active_shared even if active_local gets decremented as much as it can it could only ever lead to either matching
             // the active_shared we observed (=> not in use) or being larger than active the active shared we observed (=> in use) which would only delay
-            // us cleaning up the garbage which is okay
+            // us cleaning up the garbage which is okay and not prematurely which would result in USE-AFTER-FREE
             // TODO: is this okay performance-wise (for the cache) or should we instead add a flag into the epoch variable and check that?
             let in_use = local.active_shared.load(Ordering::Acquire)
                 != local.active_local.load(Ordering::Acquire);
