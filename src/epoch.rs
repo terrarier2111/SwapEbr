@@ -12,7 +12,7 @@ use likely_stable::unlikely;
 
 use crate::{
     epoch::conc_linked_list::ConcLinkedListNode,
-    reclamation::{ReclamationMode, ReclamationStrategy, LAZY_THRESHOLD},
+    reclamation::{ReclamationMode, ReclamationStrategy},
 };
 
 use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
@@ -33,7 +33,8 @@ struct GlobalInfo {
 }
 
 struct ColdGlobals {
-    pile: ConcLinkedList<Instance>,
+    pile: ConcLinkedList<Instance>, // FIXME: have a fixed-sized ring-buffer to not require heap allocations for everything
+    // a list of all threads that have performed a pin call before
     locals: ConcLinkedList<Inner>, // FIXME: cache reusable locals
 }
 
@@ -54,7 +55,7 @@ cfg_if! {
     } else {
         use std::thread_local;
 
-        // FIXME: are 2 seperate TLS variables actually better than 1 with an associated destructor?
+        // FIXME: are 2 separate TLS variables actually better than 1 with an associated destructor?
         thread_local! {
             static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> = const { SyncUnsafeCell::new(null_mut()) };
             static LOCAL_GUARD: LocalGuard = const { LocalGuard };
@@ -81,6 +82,7 @@ fn get_tid() -> NonZeroUsize {
 
 struct Inner {
     pile: SyncUnsafeCell<RingBuffer<Instance, LOCAL_PILE_SIZE>>,
+    global_node_ptr: *mut ConcLinkedListNode<Self>,
     epoch: AtomicUsize,
     active_local: AtomicUsize, // the MSB, if set indicates that this Inner is safe to remove
     active_shared: AtomicUsize,
@@ -96,6 +98,7 @@ impl Inner {
     fn new() -> Self {
         Self {
             pile: SyncUnsafeCell::new(RingBuffer::new()),
+            global_node_ptr: null_mut(),
             epoch: AtomicUsize::new(GLOBAL_INFO.update_epoch.load(Ordering::Acquire)),
             active_local: AtomicUsize::new(0),
             active_shared: AtomicUsize::new(0),
@@ -135,11 +138,13 @@ fn destroy_local(local: &Inner) {
             GLOBAL_INFO.cold.pile.push_front(garbage.clone());
         }
     }
+    // if there are no more active references to the local
     if local.active_shared.load(Ordering::Acquire) == local.active_local.load(Ordering::Acquire) {
         #[inline]
         fn finish(local: *const Inner) {
             // there are no more external references, so local can be cleaned up immediately
             // FIXME: don't iterate the whole list but only check a single entry (and store said entry in the local itself)
+            // FIXME: understanding: why can the local even not be present in the locals list?
             if GLOBAL_INFO
                 .cold
                 .locals
@@ -209,6 +214,7 @@ fn get_local<'a>() -> &'a Inner {
         unsafe {
             let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner::new())));
             *src = alloc;
+            (&mut *alloc).val_mut().global_node_ptr = alloc;
             GLOBAL_INFO.cold.locals.push_front_optimistic(alloc);
             #[cfg(not(feature = "no_std"))]
             LOCAL_GUARD.with(|_| {});
@@ -306,22 +312,13 @@ fn update_local<R: ReclamationStrategy>(local_info: &Inner) {
     let new = GLOBAL_INFO.update_epoch.load(Ordering::Acquire);
     local_info.epoch.store(new, Ordering::Release);
 
-    match R::mode() {
-        ReclamationMode::Eager => {
+    match R::mode().threshold() {
+        None => {
             try_cleanup(local_info, new);
         }
-        ReclamationMode::Threshold { threshold } => {
+        Some(threshold) => {
             let curr_actions = local_info.action_cnt.get() + 1;
             if curr_actions >= threshold {
-                try_cleanup(local_info, new);
-                local_info.action_cnt.set(0);
-            } else {
-                local_info.action_cnt.set(curr_actions);
-            }
-        }
-        ReclamationMode::Lazy => {
-            let curr_actions = local_info.action_cnt.get() + 1;
-            if curr_actions >= LAZY_THRESHOLD {
                 try_cleanup(local_info, new);
                 local_info.action_cnt.set(0);
             } else {
@@ -391,11 +388,9 @@ fn try_cleanup(local_info: &Inner, update_epoch: usize) {
         // don't try to update min_safe if it is already up-to-date
         return;
     }
-    let min_used = if min_used == usize::MAX {
-        update_epoch
-    } else {
-        min_used
-    };
+    if min_used == usize::MAX {
+        min_used = update_epoch;
+    }
     if min_used > min_safe {
         let mut curr_safe = min_safe;
         loop {
@@ -430,6 +425,7 @@ pub(crate) unsafe fn retire_explicit<T, R: ReclamationStrategy>(
     let old = unsafe {
         (*local.pile.get()).try_push_back(Instance::new_explicit(
             val,
+            // FIXME: explain ordering
             local.epoch.load(Ordering::Relaxed),
             cleanup,
         ))
@@ -748,6 +744,11 @@ mod conc_linked_list {
         }
 
         #[inline]
+        pub fn val_mut(&mut self) -> &mut T {
+            &mut self.val
+        }
+
+        #[inline]
         pub const fn addr_offset() -> usize {
             offset_of!(Self, val)
         }
@@ -758,9 +759,10 @@ mod ring_buf {
     use core::mem::MaybeUninit;
 
     pub(crate) struct RingBuffer<T, const LEN: usize> {
-        buf: [MaybeUninit<T>; LEN],
+        // FIXME: should we force the head and len data at the start of the struct (as it's probably accessed far more frequently)
         head: usize,
         len: usize,
+        buf: [MaybeUninit<T>; LEN],
     }
 
     impl<T, const LEN: usize> RingBuffer<T, LEN> {
@@ -831,7 +833,7 @@ mod ring_buf {
         }
     }
 
-    impl<'a, T, const LEN: usize> ExactSizeIterator for Iter<'a, T, LEN> {
+    impl<T, const LEN: usize> ExactSizeIterator for Iter<'_, T, LEN> {
         #[inline]
         fn len(&self) -> usize {
             self.src.len() - self.idx

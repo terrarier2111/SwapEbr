@@ -112,6 +112,7 @@ pub(crate) mod reclamation {
         // will lead to its local garbage pile to fill up completely and only loading threads will slowly
         // cleanup generated garbage through global
         // => this mode is the most cpu-efficient mode as it reclaims garbage only rarely
+        // Note: This can be imagined as the `Threshold` kind with a decent generic choice for the threshold parameter
         Lazy,
     }
 
@@ -124,6 +125,14 @@ pub(crate) mod reclamation {
         pub(crate) const Balanced: ReclamationMode = ReclamationMode::Threshold {
             threshold: LOCAL_PILE_SIZE / 8,
         };
+
+        pub(crate) fn threshold(&self) -> Option<usize> {
+            match self {
+                ReclamationMode::Eager => None,
+                ReclamationMode::Threshold { threshold } => Some(*threshold),
+                ReclamationMode::Lazy => Some(LAZY_THRESHOLD),
+            }
+        }
     }
 
     pub(crate) const LAZY_THRESHOLD: usize = LOCAL_PILE_SIZE;
