@@ -8,10 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use swap_it::SwapArc;
+use swap_it::{BufferedQueue, SwapArc};
 
 fn main() {
-    let mut dur = Duration::default();
+    let mut buffer = BufferedQueue::<32, i32>::new();
+    buffer.push(3518);
+    buffer.push(val);
+    /*let mut dur = Duration::default();
     let tmp = Arc::new(SwapArc::new(Arc::new(0)));
     for _ in 0..1000 {
         let started = Arc::new(AtomicBool::new(false));
@@ -36,5 +39,5 @@ fn main() {
             .for_each(|thread| thread.join().unwrap());
         dur += Instant::now().duration_since(start);
     }
-    println!("dur: {}", dur.as_millis());
+    println!("dur: {}", dur.as_millis());*/
 }

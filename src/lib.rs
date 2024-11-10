@@ -5,6 +5,7 @@
     feature(core_intrinsics),
     feature(thread_local)
 )]
+#![feature(strict_provenance)]
 
 cfg_if! {
     if #[cfg(not(feature = "no_std"))] {
@@ -23,6 +24,8 @@ use cfg_if::cfg_if;
 mod epoch;
 #[cfg(feature = "asm_thrid")]
 mod tid;
+
+pub use epoch::buffered_queue::BufferedQueue;
 
 pub use standard::Swap;
 pub use standard::SwapGuard;

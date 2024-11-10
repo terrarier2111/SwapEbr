@@ -572,25 +572,27 @@ impl<T> SyncUnsafeCell<T> {
 unsafe impl<T> Send for SyncUnsafeCell<T> {}
 unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 
-mod buffered_queue {
+pub mod buffered_queue {
     use core::{
-        mem::MaybeUninit,
+        mem::{offset_of, MaybeUninit},
         ptr::NonNull,
         sync::atomic::{AtomicU8, AtomicUsize, Ordering},
         usize,
     };
 
-    use super::{first_set_bit, wait_while, ConcLinkedList, SyncUnsafeCell};
+    use aligned::{Aligned, A2};
+
+    use super::{first_set_bit, wait_while, ConcLinkedList, ConcLinkedListNode, SyncUnsafeCell};
 
     // FIXME: test this data structure!
-    pub(crate) struct BufferedQueue<const BUFFER: usize, T> {
+    pub struct BufferedQueue<const BUFFER: usize, T> {
         // this field contains the index of the element that'S currently indexed by an iterator
         // if no element is currently indexed by an iterator, this field is usize::MAX
         // FIXME: should we instead of having a single variable for all cells, instead have one field per cell
         // FIXME: in order to reduce false sharing or cache coherency
         iter_idx: AtomicUsize,
         alloc_mask: AtomicUsize,
-        cold_list: ConcLinkedList<T>,
+        cold_list: ConcLinkedList<Aligned<A2, T>>,
         buffer: [Cell<T>; BUFFER],
     }
 
@@ -603,11 +605,11 @@ mod buffered_queue {
     struct Cell<T> {
         // this may contain flags such as the present flag
         meta_flags: AtomicU8,
-        val: SyncUnsafeCell<MaybeUninit<T>>,
+        val: SyncUnsafeCell<MaybeUninit<Aligned<A2, T>>>,
     }
 
     impl<const BUFFER: usize, T> BufferedQueue<BUFFER, T> {
-        pub(crate) const fn new() -> Self {
+        pub const fn new() -> Self {
             const {
                 if BUFFER > usize::BITS as usize / 2 {
                     // FIXME: format (usize::BITS) into this string once that's supported in const contexts
@@ -627,7 +629,11 @@ mod buffered_queue {
             }
         }
 
-        pub fn push(&self, val: T) {
+        pub(crate) fn push_front_optimistic(&self, val: T) -> QueueNode<T> {
+
+        }
+
+        pub fn push(&self, val: T) -> QueueNode<T> {
             let mut curr_mask = self.alloc_mask.load(Ordering::Acquire);
             while curr_mask != usize::MAX {
                 let slot = first_set_bit(curr_mask);
@@ -638,12 +644,11 @@ mod buffered_queue {
                     continue;
                 }
                 let slot_idx = slot.trailing_zeros() as usize;
-                unsafe { &mut *self.buffer[slot_idx].val.get() }.write(val);
+                unsafe { &mut *self.buffer[slot_idx].val.get() }.write(Aligned(val));
                 self.buffer[slot_idx].meta_flags.store(ALLOC_FLAG | PRESENT_FLAG, Ordering::Release);
-                return;
+                return QueueNode(unsafe { NonNull::new_unchecked((&mut *self.buffer[slot_idx].val.get()).as_mut_ptr()) });
             }
-            // FIXME: should the following be optimistic?
-            self.cold_list.push_front(val);
+            QueueNode(unsafe { self.cold_list.push_front_optimistic(Aligned(val)).cast::<Aligned<A2, T>>().byte_add(ConcLinkedListNode::<Aligned<A2, T>>::VAL_OFF) })
         }
 
         pub fn try_pop(&self, val: NonNull<T>) -> bool {
@@ -710,6 +715,15 @@ mod buffered_queue {
             true
         }
     }
+
+    pub struct QueueNode<T>(NonNull<Aligned<A2, T>>);
+
+    impl<T> QueueNode<T> {
+        #[inline]
+        pub fn get(&self) -> &T {
+            unsafe { &*((self.0.addr().get() & !1) as *mut Aligned<A2, T>) }
+        }
+    }
 }
 
 #[inline]
@@ -731,7 +745,7 @@ fn wait_while<F: Fn() -> bool>(f: F) {
 mod conc_linked_list {
     use core::{
         mem::offset_of,
-        ptr::null_mut,
+        ptr::{null_mut, NonNull},
         sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     };
 
@@ -783,11 +797,13 @@ mod conc_linked_list {
             }
         }
 
-        pub(crate) fn push_front_optimistic(&self, node: *mut ConcLinkedListNode<T>) {
+        pub(crate) fn push_front_optimistic(&self, val: T) -> NonNull<ConcLinkedListNode<T>> {
+            let mut node = Box::new(ConcLinkedListNode::new(val));
             // this may be relaxed as we aren't accessing any data from curr and only need to confirm
             // that it is the current value of root (even after storing it into our next value)
             let curr = self.root.load(Ordering::Relaxed);
-            *unsafe { &mut *node }.next.get_mut() = curr;
+            *node.next.get_mut() = curr;
+            let node = Box::into_raw(node);
             // FIXME: explain the release ordering here
             if unlikely(
                 self.root
@@ -821,6 +837,8 @@ mod conc_linked_list {
                 }
                 push(&self.root, node);
             }
+            // FIXME: explain safety here
+            unsafe { NonNull::new_unchecked(node) }
         }
 
         pub(crate) fn try_drain<F: FnMut(&T) -> bool>(&self, decision: F) -> bool {
@@ -889,6 +907,9 @@ mod conc_linked_list {
     }
 
     impl<T> ConcLinkedListNode<T> {
+
+        pub const VAL_OFF: usize = offset_of!(ConcLinkedListNode<T>, val);
+
         #[inline]
         pub fn new(val: T) -> Self {
             Self {
