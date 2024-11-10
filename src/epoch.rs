@@ -3,12 +3,15 @@ use cfg_if::cfg_if;
 use core::num::NonZeroUsize;
 use core::{
     cell::{Cell, UnsafeCell},
+    hint::spin_loop,
     mem::transmute,
     ptr::{drop_in_place, null_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    time::Duration,
 };
 use crossbeam_utils::CachePadded;
 use likely_stable::unlikely;
+use std::thread;
 
 use crate::{
     epoch::conc_linked_list::ConcLinkedListNode,
@@ -569,6 +572,162 @@ impl<T> SyncUnsafeCell<T> {
 unsafe impl<T> Send for SyncUnsafeCell<T> {}
 unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 
+mod buffered_queue {
+    use core::{
+        mem::MaybeUninit,
+        ptr::NonNull,
+        sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+        usize,
+    };
+
+    use super::{first_set_bit, wait_while, ConcLinkedList, SyncUnsafeCell};
+
+    // FIXME: test this data structure!
+    pub(crate) struct BufferedQueue<const BUFFER: usize, T> {
+        // this field contains the index of the element that'S currently indexed by an iterator
+        // if no element is currently indexed by an iterator, this field is usize::MAX
+        // FIXME: should we instead of having a single variable for all cells, instead have one field per cell
+        // FIXME: in order to reduce false sharing or cache coherency
+        iter_idx: AtomicUsize,
+        alloc_mask: AtomicUsize,
+        cold_list: ConcLinkedList<T>,
+        buffer: [Cell<T>; BUFFER],
+    }
+
+    /// this flag is for the cell's meta flags
+    const PRESENT_FLAG: u8 = 1 << 1;
+    const ALLOC_FLAG: u8 = 1 << 0;
+    /// no iteration flag indicates that there is no iteration happening on any element currently
+    const NO_ITER_FLAG: usize = usize::MAX as usize;
+
+    struct Cell<T> {
+        // this may contain flags such as the present flag
+        meta_flags: AtomicU8,
+        val: SyncUnsafeCell<MaybeUninit<T>>,
+    }
+
+    impl<const BUFFER: usize, T> BufferedQueue<BUFFER, T> {
+        pub(crate) const fn new() -> Self {
+            const {
+                if BUFFER > usize::BITS as usize / 2 {
+                    // FIXME: format (usize::BITS) into this string once that's supported in const contexts
+                    panic!("The buffer can be at most of the architecture's word size (usize)");
+                }
+            };
+            Self {
+                iter_idx: AtomicUsize::new(usize::MAX),
+                alloc_mask: AtomicUsize::new(0),
+                buffer: [const {
+                    Cell {
+                        val: SyncUnsafeCell::new(MaybeUninit::uninit()),
+                        /*iter: AtomicBool::new(false), */ meta_flags: AtomicU8::new(0),
+                    }
+                }; BUFFER],
+                cold_list: ConcLinkedList::new(),
+            }
+        }
+
+        pub fn push(&self, val: T) {
+            let mut curr_mask = self.alloc_mask.load(Ordering::Acquire);
+            while curr_mask != usize::MAX {
+                let slot = first_set_bit(curr_mask);
+                let prev = self.alloc_mask.fetch_or(slot, Ordering::AcqRel);
+                if prev & slot != 0 {
+                    // we raced with another thread trying to allocate slot, retry
+                    curr_mask = prev;
+                    continue;
+                }
+                let slot_idx = slot.trailing_zeros() as usize;
+                unsafe { &mut *self.buffer[slot_idx].val.get() }.write(val);
+                self.buffer[slot_idx].meta_flags.store(ALLOC_FLAG | PRESENT_FLAG, Ordering::Release);
+                return;
+            }
+            // FIXME: should the following be optimistic?
+            self.cold_list.push_front(val);
+        }
+
+        pub fn try_pop(&self, val: NonNull<T>) -> bool {
+            if val.addr().get() > (&self.buffer as *const _) as usize
+                && val.addr().get()
+                    < (&self.buffer as *const _) as usize
+                        + BUFFER * size_of::<SyncUnsafeCell<MaybeUninit<T>>>()
+            {
+                let idx = (val.addr().get() - (&self.buffer as *const _) as usize) / BUFFER;
+                // clear the PRESENT flag from flags
+                self.buffer[idx].meta_flags.store(ALLOC_FLAG, Ordering::Release);
+                // wait until we are sure there is nobody looking at the cell anymore ;) (and they have to see that it's invalidated when they dare to look again)
+                wait_while(|| self.iter_idx.load(Ordering::Acquire) == idx);
+                unsafe {
+                    (&mut *self.buffer[idx].val.0.get()).assume_init_drop();
+                }
+                // free the space
+                self.buffer[idx].meta_flags.store(0, Ordering::Release);
+                self.alloc_mask.fetch_and(!(1 << idx), Ordering::AcqRel);
+                return true;
+            }
+            self.cold_list
+                .try_drain(|other| other as *const _ as *mut _ == val.as_ptr())
+        }
+
+        pub fn try_drain<F: FnMut(&T) -> bool>(&self, mut decision: F) -> bool {
+            if self
+                .iter_idx
+                .compare_exchange(usize::MAX, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                return false;
+            }
+            for i in 0..BUFFER {
+                let flags = self.buffer[i].meta_flags.load(Ordering::Acquire);
+                if flags == ALLOC_FLAG {
+                    // fail quickly and give up when we encounter any resistance or contention
+                    return false;
+                }
+                if flags == 0 {
+                    // this slot isn't currently allocated
+                    continue;
+                }
+                if decision(unsafe { (&*self.buffer[i].val.0.get()).assume_init_ref() }) {
+                    // remove val
+                    
+                    // clear flags
+                    self.buffer[i].meta_flags.store(0, Ordering::Release);
+                    unsafe {
+                        (&mut *self.buffer[i].val.0.get()).assume_init_drop();
+                    }
+                    self.alloc_mask.fetch_and(!(1 << i), Ordering::AcqRel);
+                    // mark iterator as finished
+                    self.iter_idx.store(usize::MAX as usize, Ordering::Release);
+                    return true;
+                }
+                // this may point to an element outside of buffer which is okay as it indicates that an iterator is present but it doesn't point at any element in buffer
+                self.iter_idx.store(i + 1, Ordering::Release);
+            }
+
+            self.cold_list.drain_unchecked(decision);
+
+            self.iter_idx.store(usize::MAX as usize, Ordering::Release);
+            true
+        }
+    }
+}
+
+#[inline]
+const fn first_set_bit(val: usize) -> usize {
+    1 << val.trailing_zeros()
+}
+
+fn wait_while<F: Fn() -> bool>(f: F) {
+    let mut i = 0;
+    while f() {
+        spin_loop();
+        if i >= (u16::MAX as usize) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        i += 1;
+    }
+}
+
 mod conc_linked_list {
     use core::{
         mem::offset_of,
@@ -664,7 +823,7 @@ mod conc_linked_list {
             }
         }
 
-        pub(crate) fn try_drain<F: FnMut(&T) -> bool>(&self, mut decision: F) -> bool {
+        pub(crate) fn try_drain<F: FnMut(&T) -> bool>(&self, decision: F) -> bool {
             if self.is_empty() {
                 return true;
             }
@@ -673,51 +832,51 @@ mod conc_linked_list {
                 .compare_exchange(0, DRAIN_FLAG, Ordering::AcqRel, Ordering::Relaxed)
             {
                 Ok(_) => {
-                    let mut node_src = &self.root;
-                    let mut node = node_src.load(Ordering::Acquire);
-                    while !node.is_null() {
-                        let rem = decision(&unsafe { &*node }.val);
-                        if rem {
-                            let next = unsafe { &*node }.next.load(Ordering::Acquire);
-                            match node_src.compare_exchange(
-                                node,
-                                next,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            ) {
-                                Ok(_) => {
-                                    // delete node
-                                    let _ = unsafe { Box::from_raw(node) };
-                                    node = node_src.load(Ordering::Acquire);
-                                }
-                                Err(mut new) => {
-                                    // the update failed so our src has to have been head and a push must have happened
-
-                                    // try finding the parent of the to be removed node, starting from the beginning
-                                    loop {
-                                        node_src = &unsafe { &*new }.next;
-                                        new = node_src.load(Ordering::Acquire);
-                                        if new == node {
-                                            break;
-                                        }
-                                    }
-                                    let next = unsafe { &*new }.next.load(Ordering::Acquire);
-                                    node_src.store(next, Ordering::Release);
-                                    // delete node
-                                    let _ = unsafe { Box::from_raw(node) };
-                                    node = next;
-                                }
-                            }
-                        } else {
-                            node_src = &unsafe { &*node }.next;
-                            node = node_src.load(Ordering::Acquire);
-                        }
-                    }
+                    self.drain_unchecked(decision);
                     self.flags.store(0, Ordering::Release);
                     true
                 }
                 // there is another drain operation in progress
                 Err(_) => false,
+            }
+        }
+
+        pub(crate) fn drain_unchecked<F: FnMut(&T) -> bool>(&self, mut decision: F) {
+            let mut node_src = &self.root;
+            let mut node = node_src.load(Ordering::Acquire);
+            while !node.is_null() {
+                let rem = decision(&unsafe { &*node }.val);
+                if rem {
+                    let next = unsafe { &*node }.next.load(Ordering::Acquire);
+                    match node_src.compare_exchange(node, next, Ordering::AcqRel, Ordering::Acquire)
+                    {
+                        Ok(_) => {
+                            // delete node
+                            let _ = unsafe { Box::from_raw(node) };
+                            node = node_src.load(Ordering::Acquire);
+                        }
+                        Err(mut new) => {
+                            // the update failed so our src has to have been head and a push must have happened
+
+                            // try finding the parent of the to be removed node, starting from the beginning
+                            loop {
+                                node_src = &unsafe { &*new }.next;
+                                new = node_src.load(Ordering::Acquire);
+                                if new == node {
+                                    break;
+                                }
+                            }
+                            let next = unsafe { &*new }.next.load(Ordering::Acquire);
+                            node_src.store(next, Ordering::Release);
+                            // delete node
+                            let _ = unsafe { Box::from_raw(node) };
+                            node = next;
+                        }
+                    }
+                } else {
+                    node_src = &unsafe { &*node }.next;
+                    node = node_src.load(Ordering::Acquire);
+                }
             }
         }
     }
