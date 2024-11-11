@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use swap_it::{BufferedQueue, SwapArc};
+use swap_it::SwapArc;
 
 fn main() {
     /*let mut buffer = BufferedQueue::<32, i32>::new();

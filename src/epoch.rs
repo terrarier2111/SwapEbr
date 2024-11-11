@@ -133,7 +133,7 @@ fn destroy_local(local: *const Inner) {
     #[cfg(feature = "asm_thrid")]
     local.thrid.store(0, Ordering::Release);
     let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
-    for garbage in unsafe { &*(&*local).pile.get() }.iter() {
+    for garbage in unsafe { &*(*local).pile.get() }.iter() {
         if garbage.epoch < min_safe {
             // release garbage as nobody looks at it anymore
             unsafe {
@@ -577,16 +577,14 @@ unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 pub mod buffered_queue {
     use core::{
         mem::MaybeUninit,
-        ptr::{null_mut, NonNull},
+        ptr::null_mut,
         sync::atomic::{AtomicU8, AtomicUsize, Ordering},
-        usize,
     };
 
     use aligned::{Aligned, A2};
 
     use super::{first_unset_bit, wait_while, ConcLinkedList, ConcLinkedListNode, SyncUnsafeCell};
 
-    // FIXME: test this data structure!
     pub struct BufferedQueue<const BUFFER: usize, T> {
         // this field contains the index of the element that'S currently indexed by an iterator
         // if no element is currently indexed by an iterator, this field is usize::MAX
@@ -602,12 +600,18 @@ pub mod buffered_queue {
     const PRESENT_FLAG: u8 = 1 << 1;
     const ALLOC_FLAG: u8 = 1 << 0;
     /// no iteration flag indicates that there is no iteration happening on any element currently
-    const NO_ITER_FLAG: usize = usize::MAX as usize;
+    const NO_ITER_FLAG: usize = usize::MAX;
 
     struct Cell<T> {
         // this may contain flags such as the present flag
         meta_flags: AtomicU8,
         val: SyncUnsafeCell<MaybeUninit<Aligned<A2, T>>>,
+    }
+
+    impl<const BUFFER: usize, T> Default for BufferedQueue<BUFFER, T> {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl<const BUFFER: usize, T> BufferedQueue<BUFFER, T> {
@@ -657,11 +661,11 @@ pub mod buffered_queue {
                 let slot_idx = slot.trailing_zeros() as usize;
                 unsafe { &mut *self.buffer[slot_idx].val.get() }.write(Aligned(val));
                 // call user provided setup routine
-                f(unsafe { (&mut *self.buffer[slot_idx].val.get()).assume_init_mut() });
+                f(unsafe { (*self.buffer[slot_idx].val.get()).assume_init_mut() });
                 self.buffer[slot_idx]
                     .meta_flags
                     .store(ALLOC_FLAG | PRESENT_FLAG, Ordering::Release);
-                return QueueNode(unsafe { (&mut *self.buffer[slot_idx].val.get()).as_mut_ptr() });
+                return QueueNode(unsafe { (*self.buffer[slot_idx].val.get()).as_ptr() as *mut _ });
             }
             QueueNode(unsafe {
                 self.cold_list
@@ -688,7 +692,7 @@ pub mod buffered_queue {
                 // wait until we are sure there is nobody looking at the cell anymore ;) (and they have to see that it's invalidated when they dare to look again)
                 wait_while(|| self.iter_idx.load(Ordering::Acquire) == idx);
                 unsafe {
-                    (&mut *self.buffer[idx].val.0.get()).assume_init_drop();
+                    (*self.buffer[idx].val.0.get()).assume_init_drop();
                 }
                 // free the space
                 self.buffer[idx].meta_flags.store(0, Ordering::Release);
@@ -717,13 +721,13 @@ pub mod buffered_queue {
                     // this slot isn't currently allocated
                     continue;
                 }
-                if decision(unsafe { (&*self.buffer[i].val.0.get()).assume_init_ref() }) {
+                if decision(unsafe { (*self.buffer[i].val.0.get()).assume_init_ref() }) {
                     // remove val
 
                     // clear flags
                     self.buffer[i].meta_flags.store(0, Ordering::Release);
                     unsafe {
-                        (&mut *self.buffer[i].val.0.get()).assume_init_drop();
+                        (*self.buffer[i].val.0.get()).assume_init_drop();
                     }
                     self.alloc_mask.fetch_and(!(1 << i), Ordering::AcqRel);
                     // mark iterator as finished
@@ -746,7 +750,7 @@ pub mod buffered_queue {
     impl<T> Clone for QueueNode<T> {
         #[inline]
         fn clone(&self) -> Self {
-            Self(self.0.clone())
+            Self(self.0)
         }
     }
 
@@ -758,7 +762,7 @@ pub mod buffered_queue {
             if self.0.is_null() {
                 return None;
             }
-            Some(unsafe { &*(self.0.map_addr(|addr| addr & !1) as *mut Aligned<A2, T>) })
+            Some(unsafe { &*self.0.map_addr(|addr| addr & !1) })
         }
 
         #[inline]
@@ -766,7 +770,7 @@ pub mod buffered_queue {
             if self.0.is_null() {
                 return None;
             }
-            Some(unsafe { &*(self.0.map_addr(|addr| addr & !1) as *mut Aligned<A2, T>) })
+            Some(unsafe { &*self.0.map_addr(|addr| addr & !1) })
         }
     }
 }
