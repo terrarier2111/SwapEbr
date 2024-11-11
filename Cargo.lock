@@ -299,15 +299,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c8640c5d730cb13ebd907d8d04b52f55ac9a2eec55b440c8892f40d56c76c1d"
 
 [[package]]
-name = "memoffset"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -550,17 +541,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 
 [[package]]
-name = "swap-arc"
-version = "0.1.1"
-source = "git+https://github.com/terrarier2111/SwapArc#3a1c7e39b73bba6a614ae10e61ab75a727c9492e"
-dependencies = [
- "cfg-if",
- "crossbeam-utils",
- "likely_stable",
- "thread_local",
-]
-
-[[package]]
 name = "swap_it"
 version = "0.1.0"
 dependencies = [
@@ -573,7 +553,6 @@ dependencies = [
  "libc",
  "likely_stable",
  "rand",
- "swap-arc",
 ]
 
 [[package]]
@@ -605,17 +584,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "thread_local"
-version = "1.1.7"
-source = "git+https://github.com/terrarier2111/thread_local-rs/#fd17302bccf5ead94e54f7f7b9c74d5ccca7b200"
-dependencies = [
- "cfg-if",
- "crossbeam-utils",
- "memoffset",
- "once_cell",
 ]
 
 [[package]]

@@ -28,7 +28,7 @@ rand = "0"
 arc-swap = "1"
 criterion = "0"
 # swap-arc = "0.1.1"
-swap-arc = { git = "https://github.com/terrarier2111/SwapArc" }
+#swap-arc = { git = "https://github.com/terrarier2111/SwapArc" }
 aarc = "0"
 # FIXME: for some reason this currently doesn't work properly, make it work!
 # thrid = { git = "https://github.com/terrarier2111/thrid", optional = true }

@@ -1,3 +1,4 @@
+use aligned::{Aligned, A2};
 use buffered_queue::QueueNode;
 use cfg_if::cfg_if;
 #[cfg(feature = "asm_thrid")]
@@ -6,8 +7,7 @@ use core::{
     cell::{Cell, UnsafeCell},
     hint::spin_loop,
     mem::transmute,
-    ops::{Deref, DerefMut},
-    ptr::{drop_in_place, null_mut, NonNull},
+    ptr::{drop_in_place, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     time::Duration,
 };
@@ -23,9 +23,12 @@ use crate::{
 
 use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
 
+// FIXME: would it be possible to ensure that if a thread crashes/freezes only garbage that got retired before it crashed(when it waqs still active) will remain unclaimed?
+// FIXME: somewhere in this impl there is probably a bug as a program started to pile up garbage without freeing it in experimentation. (no idea why tho)
+
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     cold: CachePadded::new(ColdGlobals {
-        pile: ConcLinkedList::new(),
+        pile: BufferedQueue::new(),
         locals: BufferedQueue::new(),
     }),
     update_epoch: AtomicUsize::new(0),
@@ -39,9 +42,9 @@ struct GlobalInfo {
 }
 
 struct ColdGlobals {
-    pile: ConcLinkedList<Instance>, // FIXME: have a fixed-sized ring-buffer to not require heap allocations for everything
+    pile: BufferedQueue<32, Instance>,
     // a list of all threads that have performed a pin call before
-    locals: BufferedQueue<32, Inner>, // FIXME: cache reusable locals
+    locals: BufferedQueue<32, Inner>,
 }
 
 cfg_if! {
@@ -50,11 +53,11 @@ cfg_if! {
         use alloc::boxed::Box;
 
         #[thread_local]
-        static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> =
-            SyncUnsafeCell::new(null_mut());
+        static LOCAL_INFO: SyncUnsafeCell<QueueNode<Inner>> =
+            SyncUnsafeCell::new(QueueNode::NULL);
 
         #[inline]
-        fn local_raw_ptr() -> *mut *const ConcLinkedListNode<Inner> {
+        fn local_raw_ptr() -> *mut QueueNode<Inner> {
             let src = LOCAL_INFO.get();
             src
         }
@@ -88,7 +91,6 @@ fn get_tid() -> NonZeroUsize {
 
 struct Inner {
     pile: SyncUnsafeCell<RingBuffer<Instance, LOCAL_PILE_SIZE>>,
-    global_node_ptr: *mut Self,
     epoch: AtomicUsize,
     active_local: AtomicUsize, // the MSB, if set indicates that this Inner is safe to remove
     active_shared: AtomicUsize,
@@ -104,7 +106,6 @@ impl Inner {
     fn new() -> Self {
         Self {
             pile: SyncUnsafeCell::new(RingBuffer::new()),
-            global_node_ptr: null_mut(),
             epoch: AtomicUsize::new(GLOBAL_INFO.update_epoch.load(Ordering::Acquire)),
             active_local: AtomicUsize::new(0),
             active_shared: AtomicUsize::new(0),
@@ -121,13 +122,14 @@ struct LocalGuard;
 
 impl Drop for LocalGuard {
     fn drop(&mut self) {
-        if let Some(local) = try_get_local() {
-            destroy_local(local);
+        let local = local_ptr();
+        if !local.is_null() {
+            destroy_local(local.inner_raw());
         }
     }
 }
 
-fn destroy_local(local: *const Inner) {
+fn destroy_local(local: *const Aligned<A2, Inner>) {
     // store a sentinel in order to ensure that if our thread id gets reassigned to a new thread
     // a comparison in the guard's drop function will always fail (as it should)
     #[cfg(feature = "asm_thrid")]
@@ -141,7 +143,7 @@ fn destroy_local(local: *const Inner) {
             }
         } else {
             // push garbage onto pile
-            GLOBAL_INFO.cold.pile.push_front(garbage.clone());
+            GLOBAL_INFO.cold.pile.push(garbage.clone());
         }
     }
     // if there are no more active references to the local
@@ -149,14 +151,13 @@ fn destroy_local(local: *const Inner) {
         == unsafe { &*local }.active_local.load(Ordering::Acquire)
     {
         #[inline]
-        fn finish(local: *const Inner) {
+        fn finish(local: *const Aligned<A2, Inner>) {
             // there are no more external references, so local can be cleaned up immediately
-            // FIXME: don't iterate the whole list but only check a single entry (and store said entry in the local itself)
             // FIXME: understanding: why can the local even not be present in the locals list?
             if GLOBAL_INFO
                 .cold
                 .locals
-                .try_drain(|curr| curr.deref() as *const _ == local)
+                .try_pop(unsafe { QueueNode::from_raw(local.cast_mut()) })
             {
                 // we don't have to cleanup the local as its in the same allocation as the node
             } else {
@@ -220,12 +221,7 @@ fn get_local<'a>() -> &'a Inner {
     fn alloc_local<'a>() -> &'a Inner {
         let src = local_raw_ptr();
         unsafe {
-            let val = GLOBAL_INFO
-                .cold
-                .locals
-                .push_front_optimistic(Inner::new(), |val| {
-                    val.global_node_ptr = val.deref_mut() as *mut _;
-                });
+            let val = GLOBAL_INFO.cold.locals.push_front_optimistic(Inner::new());
             *src = val.clone();
             #[cfg(not(feature = "no_std"))]
             LOCAL_GUARD.with(|_| {});
@@ -443,7 +439,7 @@ pub(crate) unsafe fn retire_explicit<T, R: ReclamationStrategy>(
     };
     if let Some(old) = old {
         // there is no more space in the local pile, try letting global handle our old garbage instead
-        GLOBAL_INFO.cold.pile.push_front(old);
+        GLOBAL_INFO.cold.pile.push(old);
     }
     let new_epoch = increment_update_epoch();
     local.epoch.store(new_epoch, Ordering::Release);
@@ -639,16 +635,12 @@ pub mod buffered_queue {
             self.alloc_mask.load(Ordering::Acquire) == 0 && self.cold_list.is_empty()
         }
 
-        pub(crate) fn push_front_optimistic<F: Fn(&mut Aligned<A2, T>)>(
-            &self,
-            val: T,
-            f: F,
-        ) -> QueueNode<T> {
+        pub(crate) fn push_front_optimistic(&self, val: T) -> QueueNode<T> {
             // FIXME: MAYBE: make this actually optimistic?
-            self.push(val, f)
+            self.push(val)
         }
 
-        pub fn push<F: Fn(&mut Aligned<A2, T>)>(&self, val: T, f: F) -> QueueNode<T> {
+        pub fn push(&self, val: T) -> QueueNode<T> {
             let mut curr_mask = self.alloc_mask.load(Ordering::Acquire);
             while curr_mask != usize::MAX {
                 let slot = first_unset_bit(curr_mask);
@@ -660,8 +652,6 @@ pub mod buffered_queue {
                 }
                 let slot_idx = slot.trailing_zeros() as usize;
                 unsafe { &mut *self.buffer[slot_idx].val.get() }.write(Aligned(val));
-                // call user provided setup routine
-                f(unsafe { (*self.buffer[slot_idx].val.get()).assume_init_mut() });
                 self.buffer[slot_idx]
                     .meta_flags
                     .store(ALLOC_FLAG | PRESENT_FLAG, Ordering::Release);
@@ -669,7 +659,7 @@ pub mod buffered_queue {
             }
             QueueNode(unsafe {
                 self.cold_list
-                    .push_front_optimistic(Aligned(val), f)
+                    .push_front_optimistic(Aligned(val))
                     .cast::<Aligned<A2, T>>()
                     .byte_add(ConcLinkedListNode::<Aligned<A2, T>>::VAL_OFF)
                     .as_ptr()
@@ -758,6 +748,21 @@ pub mod buffered_queue {
         pub const NULL: QueueNode<T> = Self(null_mut());
 
         #[inline]
+        pub const unsafe fn from_raw(raw: *mut Aligned<A2, T>) -> Self {
+            Self(raw)
+        }
+
+        #[inline]
+        pub fn is_null(&self) -> bool {
+            self.0.is_null()
+        }
+
+        #[inline]
+        pub const fn inner_raw(&self) -> *mut Aligned<A2, T> {
+            self.0
+        }
+
+        #[inline]
         pub unsafe fn get(&self) -> Option<&T> {
             if self.0.is_null() {
                 return None;
@@ -794,7 +799,6 @@ fn wait_while<F: Fn() -> bool>(f: F) {
 mod conc_linked_list {
     use core::{
         mem::offset_of,
-        ops::DerefMut,
         ptr::{null_mut, NonNull},
         sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     };
@@ -847,14 +851,8 @@ mod conc_linked_list {
             }
         }
 
-        pub(crate) fn push_front_optimistic<F: Fn(&mut T)>(
-            &self,
-            val: T,
-            f: F,
-        ) -> NonNull<ConcLinkedListNode<T>> {
+        pub(crate) fn push_front_optimistic(&self, val: T) -> NonNull<ConcLinkedListNode<T>> {
             let mut node = Box::new(ConcLinkedListNode::new(val));
-            // call user provided setup routine
-            f(&mut node.deref_mut().val);
             // this may be relaxed as we aren't accessing any data from curr and only need to confirm
             // that it is the current value of root (even after storing it into our next value)
             let curr = self.root.load(Ordering::Relaxed);
