@@ -1,13 +1,9 @@
+use buffered_queue::QueueNode;
 use cfg_if::cfg_if;
 #[cfg(feature = "asm_thrid")]
 use core::num::NonZeroUsize;
 use core::{
-    cell::{Cell, UnsafeCell},
-    hint::spin_loop,
-    mem::transmute,
-    ptr::{drop_in_place, null_mut, NonNull},
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
-    time::Duration,
+    cell::{Cell, UnsafeCell}, hint::spin_loop, mem::transmute, ops::{Deref, DerefMut}, ptr::{drop_in_place, null_mut, NonNull}, sync::atomic::{AtomicPtr, AtomicUsize, Ordering}, time::Duration
 };
 use crossbeam_utils::CachePadded;
 use likely_stable::unlikely;
@@ -15,7 +11,7 @@ use std::thread;
 
 use crate::{
     epoch::conc_linked_list::ConcLinkedListNode,
-    reclamation::{ReclamationMode, ReclamationStrategy},
+    reclamation::{ReclamationMode, ReclamationStrategy}, BufferedQueue,
 };
 
 use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
@@ -23,7 +19,7 @@ use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     cold: CachePadded::new(ColdGlobals {
         pile: ConcLinkedList::new(),
-        locals: ConcLinkedList::new(),
+        locals: BufferedQueue::new(),
     }),
     update_epoch: AtomicUsize::new(0),
     min_safe_epoch: AtomicUsize::new(0),
@@ -38,7 +34,7 @@ struct GlobalInfo {
 struct ColdGlobals {
     pile: ConcLinkedList<Instance>, // FIXME: have a fixed-sized ring-buffer to not require heap allocations for everything
     // a list of all threads that have performed a pin call before
-    locals: ConcLinkedList<Inner>, // FIXME: cache reusable locals
+    locals: BufferedQueue<32, Inner>, // FIXME: cache reusable locals
 }
 
 cfg_if! {
@@ -60,12 +56,12 @@ cfg_if! {
 
         // FIXME: are 2 separate TLS variables actually better than 1 with an associated destructor?
         thread_local! {
-            static LOCAL_INFO: SyncUnsafeCell<*const ConcLinkedListNode<Inner>> = const { SyncUnsafeCell::new(null_mut()) };
+            static LOCAL_INFO: SyncUnsafeCell<QueueNode<Inner>> = const { SyncUnsafeCell::new(QueueNode::NULL) };
             static LOCAL_GUARD: LocalGuard = const { LocalGuard };
         }
 
         #[inline]
-        fn local_raw_ptr() -> *mut *const ConcLinkedListNode<Inner> {
+        fn local_raw_ptr() -> *mut QueueNode<Inner> {
             LOCAL_INFO.with(|ptr| ptr.get())
         }
     }
@@ -85,7 +81,7 @@ fn get_tid() -> NonZeroUsize {
 
 struct Inner {
     pile: SyncUnsafeCell<RingBuffer<Instance, LOCAL_PILE_SIZE>>,
-    global_node_ptr: *mut ConcLinkedListNode<Self>,
+    global_node_ptr: *mut Self,
     epoch: AtomicUsize,
     active_local: AtomicUsize, // the MSB, if set indicates that this Inner is safe to remove
     active_shared: AtomicUsize,
@@ -124,13 +120,13 @@ impl Drop for LocalGuard {
     }
 }
 
-fn destroy_local(local: &Inner) {
+fn destroy_local(local: *const Inner) {
     // store a sentinel in order to ensure that if our thread id gets reassigned to a new thread
     // a comparison in the guard's drop function will always fail (as it should)
     #[cfg(feature = "asm_thrid")]
     local.thrid.store(0, Ordering::Release);
     let min_safe = GLOBAL_INFO.min_safe_epoch.load(Ordering::Acquire);
-    for garbage in unsafe { &*local.pile.get() }.iter() {
+    for garbage in unsafe { &*(&*local).pile.get() }.iter() {
         if garbage.epoch < min_safe {
             // release garbage as nobody looks at it anymore
             unsafe {
@@ -142,7 +138,7 @@ fn destroy_local(local: &Inner) {
         }
     }
     // if there are no more active references to the local
-    if local.active_shared.load(Ordering::Acquire) == local.active_local.load(Ordering::Acquire) {
+    if unsafe { &*local }.active_shared.load(Ordering::Acquire) == unsafe { &*local }.active_local.load(Ordering::Acquire) {
         #[inline]
         fn finish(local: *const Inner) {
             // there are no more external references, so local can be cleaned up immediately
@@ -151,7 +147,7 @@ fn destroy_local(local: &Inner) {
             if GLOBAL_INFO
                 .cold
                 .locals
-                .try_drain(|curr| curr as *const _ == local)
+                .try_drain(|curr| curr.deref() as *const _ == local)
             {
                 // we don't have to cleanup the local as its in the same allocation as the node
             } else {
@@ -163,7 +159,7 @@ fn destroy_local(local: &Inner) {
                 );
             }
         }
-        finish(local as *const Inner);
+        finish(local);
     } else {
         // NOTE: at this point we know that there must be external references
         // to data retrieves through this guard remaining
@@ -198,14 +194,14 @@ unsafe impl Send for Instance {}
 unsafe impl Sync for Instance {}
 
 #[inline]
-fn local_ptr() -> *const ConcLinkedListNode<Inner> {
+fn local_ptr() -> QueueNode<Inner> {
     let src = local_raw_ptr();
-    unsafe { *src }
+    unsafe { &*src }.clone()
 }
 
 #[inline]
 fn try_get_local<'a>() -> Option<&'a Inner> {
-    unsafe { local_ptr().as_ref().map(|node| node.val()) }
+    unsafe { local_ptr().get_unbound() }
 }
 
 #[inline]
@@ -215,13 +211,13 @@ fn get_local<'a>() -> &'a Inner {
     fn alloc_local<'a>() -> &'a Inner {
         let src = local_raw_ptr();
         unsafe {
-            let alloc = Box::into_raw(Box::new(ConcLinkedListNode::new(Inner::new())));
-            *src = alloc;
-            (&mut *alloc).val_mut().global_node_ptr = alloc;
-            GLOBAL_INFO.cold.locals.push_front_optimistic(alloc);
+            let val = GLOBAL_INFO.cold.locals.push_front_optimistic(Inner::new(), |val| {
+                val.global_node_ptr = val.deref_mut() as *mut _;
+            });
+            *src = val.clone();
             #[cfg(not(feature = "no_std"))]
             LOCAL_GUARD.with(|_| {});
-            (*alloc).val()
+            val.get_unbound().unwrap_unchecked()
         }
     }
 
@@ -529,9 +525,7 @@ impl Drop for LocalPinGuard {
         // fast path for thread local releases
         if self.0
             == unsafe {
-                local_ptr()
-                    .byte_add(ConcLinkedListNode::<Inner>::addr_offset())
-                    .cast::<Inner>()
+                local_ptr().get().unwrap() as *const Inner
             }
         {
             inner.active_local.store(
@@ -574,15 +568,15 @@ unsafe impl<T> Sync for SyncUnsafeCell<T> {}
 
 pub mod buffered_queue {
     use core::{
-        mem::{offset_of, MaybeUninit},
-        ptr::NonNull,
+        mem::MaybeUninit,
+        ptr::{null_mut, NonNull},
         sync::atomic::{AtomicU8, AtomicUsize, Ordering},
         usize,
     };
 
     use aligned::{Aligned, A2};
 
-    use super::{first_set_bit, wait_while, ConcLinkedList, ConcLinkedListNode, SyncUnsafeCell};
+    use super::{first_unset_bit, wait_while, ConcLinkedList, ConcLinkedListNode, SyncUnsafeCell};
 
     // FIXME: test this data structure!
     pub struct BufferedQueue<const BUFFER: usize, T> {
@@ -629,14 +623,19 @@ pub mod buffered_queue {
             }
         }
 
-        pub(crate) fn push_front_optimistic(&self, val: T) -> QueueNode<T> {
-
+        pub fn is_empty(&self) -> bool {
+            self.alloc_mask.load(Ordering::Acquire) == 0 && self.cold_list.is_empty()
         }
 
-        pub fn push(&self, val: T) -> QueueNode<T> {
+        pub(crate) fn push_front_optimistic<F: Fn(&mut Aligned<A2, T>)>(&self, val: T, f: F) -> QueueNode<T> {
+            // FIXME: MAYBE: make this actually optimistic?
+            self.push(val, f)
+        }
+
+        pub fn push<F: Fn(&mut Aligned<A2, T>)>(&self, val: T, f: F) -> QueueNode<T> {
             let mut curr_mask = self.alloc_mask.load(Ordering::Acquire);
             while curr_mask != usize::MAX {
-                let slot = first_set_bit(curr_mask);
+                let slot = first_unset_bit(curr_mask);
                 let prev = self.alloc_mask.fetch_or(slot, Ordering::AcqRel);
                 if prev & slot != 0 {
                     // we raced with another thread trying to allocate slot, retry
@@ -645,19 +644,26 @@ pub mod buffered_queue {
                 }
                 let slot_idx = slot.trailing_zeros() as usize;
                 unsafe { &mut *self.buffer[slot_idx].val.get() }.write(Aligned(val));
+                // call user provided setup routine
+                f(unsafe { (&mut *self.buffer[slot_idx].val.get()).assume_init_mut() });
                 self.buffer[slot_idx].meta_flags.store(ALLOC_FLAG | PRESENT_FLAG, Ordering::Release);
-                return QueueNode(unsafe { NonNull::new_unchecked((&mut *self.buffer[slot_idx].val.get()).as_mut_ptr()) });
+                return QueueNode(unsafe { (&mut *self.buffer[slot_idx].val.get()).as_mut_ptr() });
             }
-            QueueNode(unsafe { self.cold_list.push_front_optimistic(Aligned(val)).cast::<Aligned<A2, T>>().byte_add(ConcLinkedListNode::<Aligned<A2, T>>::VAL_OFF) })
+            QueueNode(unsafe { self.cold_list.push_front_optimistic(Aligned(val), f).cast::<Aligned<A2, T>>().byte_add(ConcLinkedListNode::<Aligned<A2, T>>::VAL_OFF).as_ptr() })
         }
 
-        pub fn try_pop(&self, val: NonNull<T>) -> bool {
-            if val.addr().get() > (&self.buffer as *const _) as usize
-                && val.addr().get()
+        pub fn try_pop(&self, val: QueueNode<T>) -> bool {
+            if val.0.is_null() {
+                unreachable!("Tried removing null node");
+            }
+            let val = val.0;
+            if val.addr() >= (&self.buffer as *const _) as usize
+                && val.addr()
                     < (&self.buffer as *const _) as usize
-                        + BUFFER * size_of::<SyncUnsafeCell<MaybeUninit<T>>>()
+                        + BUFFER * size_of::<Cell<T>>()
             {
-                let idx = (val.addr().get() - (&self.buffer as *const _) as usize) / BUFFER;
+                println!("rem local {}", self.alloc_mask.load(Ordering::Acquire).count_ones());
+                let idx = (val.addr() - (&self.buffer as *const _) as usize) / size_of::<Cell<T>>();
                 // clear the PRESENT flag from flags
                 self.buffer[idx].meta_flags.store(ALLOC_FLAG, Ordering::Release);
                 // wait until we are sure there is nobody looking at the cell anymore ;) (and they have to see that it's invalidated when they dare to look again)
@@ -671,10 +677,10 @@ pub mod buffered_queue {
                 return true;
             }
             self.cold_list
-                .try_drain(|other| other as *const _ as *mut _ == val.as_ptr())
+                .try_drain(|other| other as *const _ as *mut _ == val)
         }
 
-        pub fn try_drain<F: FnMut(&T) -> bool>(&self, mut decision: F) -> bool {
+        pub fn try_drain<F: FnMut(&Aligned<A2, T>) -> bool>(&self, mut decision: F) -> bool {
             if self
                 .iter_idx
                 .compare_exchange(usize::MAX, 0, Ordering::AcqRel, Ordering::Relaxed)
@@ -716,19 +722,40 @@ pub mod buffered_queue {
         }
     }
 
-    pub struct QueueNode<T>(NonNull<Aligned<A2, T>>);
+    pub struct QueueNode<T>(*mut Aligned<A2, T>);
+
+    impl<T> Clone for QueueNode<T> {
+        #[inline]
+        fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+    }
 
     impl<T> QueueNode<T> {
+
+        pub const NULL: QueueNode<T> = Self(null_mut());
+
         #[inline]
-        pub fn get(&self) -> &T {
-            unsafe { &*((self.0.addr().get() & !1) as *mut Aligned<A2, T>) }
+        pub unsafe fn get(&self) -> Option<&T> {
+            if self.0.is_null() {
+                return None;
+            }
+            Some(unsafe { &*(self.0.map_addr(|addr| addr & !1) as *mut Aligned<A2, T>) })
+        }
+
+        #[inline]
+        pub unsafe fn get_unbound<'a>(&self) -> Option<&'a T> {
+            if self.0.is_null() {
+                return None;
+            }
+            Some(unsafe { &*(self.0.map_addr(|addr| addr & !1) as *mut Aligned<A2, T>) })
         }
     }
 }
 
 #[inline]
-const fn first_set_bit(val: usize) -> usize {
-    1 << val.trailing_zeros()
+const fn first_unset_bit(val: usize) -> usize {
+    1 << val.trailing_ones()
 }
 
 fn wait_while<F: Fn() -> bool>(f: F) {
@@ -744,9 +771,7 @@ fn wait_while<F: Fn() -> bool>(f: F) {
 
 mod conc_linked_list {
     use core::{
-        mem::offset_of,
-        ptr::{null_mut, NonNull},
-        sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+        mem::offset_of, ops::DerefMut, ptr::{null_mut, NonNull}, sync::atomic::{AtomicPtr, AtomicUsize, Ordering}
     };
 
     #[cfg(feature = "no_std")]
@@ -797,8 +822,10 @@ mod conc_linked_list {
             }
         }
 
-        pub(crate) fn push_front_optimistic(&self, val: T) -> NonNull<ConcLinkedListNode<T>> {
+        pub(crate) fn push_front_optimistic<F: Fn(&mut T)>(&self, val: T, f: F) -> NonNull<ConcLinkedListNode<T>> {
             let mut node = Box::new(ConcLinkedListNode::new(val));
+            // call user provided setup routine
+            f(&mut node.deref_mut().val);
             // this may be relaxed as we aren't accessing any data from curr and only need to confirm
             // that it is the current value of root (even after storing it into our next value)
             let curr = self.root.load(Ordering::Relaxed);
