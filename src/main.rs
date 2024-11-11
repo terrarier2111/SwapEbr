@@ -30,7 +30,9 @@ fn main() {
                 while !started.load(Ordering::Acquire) {
                     spin_loop();
                 }
-                for _ in 0..200/*200000*/ {
+                for _ in 0..200
+                /*200000*/
+                {
                     let l1 = tmp.load();
                     black_box(l1);
                 }

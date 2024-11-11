@@ -3,7 +3,13 @@ use cfg_if::cfg_if;
 #[cfg(feature = "asm_thrid")]
 use core::num::NonZeroUsize;
 use core::{
-    cell::{Cell, UnsafeCell}, hint::spin_loop, mem::transmute, ops::{Deref, DerefMut}, ptr::{drop_in_place, null_mut, NonNull}, sync::atomic::{AtomicPtr, AtomicUsize, Ordering}, time::Duration
+    cell::{Cell, UnsafeCell},
+    hint::spin_loop,
+    mem::transmute,
+    ops::{Deref, DerefMut},
+    ptr::{drop_in_place, null_mut, NonNull},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    time::Duration,
 };
 use crossbeam_utils::CachePadded;
 use likely_stable::unlikely;
@@ -11,7 +17,8 @@ use std::thread;
 
 use crate::{
     epoch::conc_linked_list::ConcLinkedListNode,
-    reclamation::{ReclamationMode, ReclamationStrategy}, BufferedQueue,
+    reclamation::{ReclamationMode, ReclamationStrategy},
+    BufferedQueue,
 };
 
 use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
@@ -138,7 +145,9 @@ fn destroy_local(local: *const Inner) {
         }
     }
     // if there are no more active references to the local
-    if unsafe { &*local }.active_shared.load(Ordering::Acquire) == unsafe { &*local }.active_local.load(Ordering::Acquire) {
+    if unsafe { &*local }.active_shared.load(Ordering::Acquire)
+        == unsafe { &*local }.active_local.load(Ordering::Acquire)
+    {
         #[inline]
         fn finish(local: *const Inner) {
             // there are no more external references, so local can be cleaned up immediately
@@ -211,9 +220,12 @@ fn get_local<'a>() -> &'a Inner {
     fn alloc_local<'a>() -> &'a Inner {
         let src = local_raw_ptr();
         unsafe {
-            let val = GLOBAL_INFO.cold.locals.push_front_optimistic(Inner::new(), |val| {
-                val.global_node_ptr = val.deref_mut() as *mut _;
-            });
+            let val = GLOBAL_INFO
+                .cold
+                .locals
+                .push_front_optimistic(Inner::new(), |val| {
+                    val.global_node_ptr = val.deref_mut() as *mut _;
+                });
             *src = val.clone();
             #[cfg(not(feature = "no_std"))]
             LOCAL_GUARD.with(|_| {});
@@ -523,11 +535,7 @@ impl Drop for LocalPinGuard {
         // reduce local cnt safely even if src thread terminated
 
         // fast path for thread local releases
-        if self.0
-            == unsafe {
-                local_ptr().get().unwrap() as *const Inner
-            }
-        {
+        if self.0 == unsafe { local_ptr().get().unwrap() as *const Inner } {
             inner.active_local.store(
                 inner.active_local.load(Ordering::Relaxed) - 1,
                 Ordering::Release,
@@ -627,7 +635,11 @@ pub mod buffered_queue {
             self.alloc_mask.load(Ordering::Acquire) == 0 && self.cold_list.is_empty()
         }
 
-        pub(crate) fn push_front_optimistic<F: Fn(&mut Aligned<A2, T>)>(&self, val: T, f: F) -> QueueNode<T> {
+        pub(crate) fn push_front_optimistic<F: Fn(&mut Aligned<A2, T>)>(
+            &self,
+            val: T,
+            f: F,
+        ) -> QueueNode<T> {
             // FIXME: MAYBE: make this actually optimistic?
             self.push(val, f)
         }
@@ -646,10 +658,18 @@ pub mod buffered_queue {
                 unsafe { &mut *self.buffer[slot_idx].val.get() }.write(Aligned(val));
                 // call user provided setup routine
                 f(unsafe { (&mut *self.buffer[slot_idx].val.get()).assume_init_mut() });
-                self.buffer[slot_idx].meta_flags.store(ALLOC_FLAG | PRESENT_FLAG, Ordering::Release);
+                self.buffer[slot_idx]
+                    .meta_flags
+                    .store(ALLOC_FLAG | PRESENT_FLAG, Ordering::Release);
                 return QueueNode(unsafe { (&mut *self.buffer[slot_idx].val.get()).as_mut_ptr() });
             }
-            QueueNode(unsafe { self.cold_list.push_front_optimistic(Aligned(val), f).cast::<Aligned<A2, T>>().byte_add(ConcLinkedListNode::<Aligned<A2, T>>::VAL_OFF).as_ptr() })
+            QueueNode(unsafe {
+                self.cold_list
+                    .push_front_optimistic(Aligned(val), f)
+                    .cast::<Aligned<A2, T>>()
+                    .byte_add(ConcLinkedListNode::<Aligned<A2, T>>::VAL_OFF)
+                    .as_ptr()
+            })
         }
 
         pub fn try_pop(&self, val: QueueNode<T>) -> bool {
@@ -658,14 +678,13 @@ pub mod buffered_queue {
             }
             let val = val.0;
             if val.addr() >= (&self.buffer as *const _) as usize
-                && val.addr()
-                    < (&self.buffer as *const _) as usize
-                        + BUFFER * size_of::<Cell<T>>()
+                && val.addr() < (&self.buffer as *const _) as usize + BUFFER * size_of::<Cell<T>>()
             {
-                println!("rem local {}", self.alloc_mask.load(Ordering::Acquire).count_ones());
                 let idx = (val.addr() - (&self.buffer as *const _) as usize) / size_of::<Cell<T>>();
                 // clear the PRESENT flag from flags
-                self.buffer[idx].meta_flags.store(ALLOC_FLAG, Ordering::Release);
+                self.buffer[idx]
+                    .meta_flags
+                    .store(ALLOC_FLAG, Ordering::Release);
                 // wait until we are sure there is nobody looking at the cell anymore ;) (and they have to see that it's invalidated when they dare to look again)
                 wait_while(|| self.iter_idx.load(Ordering::Acquire) == idx);
                 unsafe {
@@ -683,7 +702,7 @@ pub mod buffered_queue {
         pub fn try_drain<F: FnMut(&Aligned<A2, T>) -> bool>(&self, mut decision: F) -> bool {
             if self
                 .iter_idx
-                .compare_exchange(usize::MAX, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(NO_ITER_FLAG, 0, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {
                 return false;
@@ -700,7 +719,7 @@ pub mod buffered_queue {
                 }
                 if decision(unsafe { (&*self.buffer[i].val.0.get()).assume_init_ref() }) {
                     // remove val
-                    
+
                     // clear flags
                     self.buffer[i].meta_flags.store(0, Ordering::Release);
                     unsafe {
@@ -708,7 +727,7 @@ pub mod buffered_queue {
                     }
                     self.alloc_mask.fetch_and(!(1 << i), Ordering::AcqRel);
                     // mark iterator as finished
-                    self.iter_idx.store(usize::MAX as usize, Ordering::Release);
+                    self.iter_idx.store(NO_ITER_FLAG, Ordering::Release);
                     return true;
                 }
                 // this may point to an element outside of buffer which is okay as it indicates that an iterator is present but it doesn't point at any element in buffer
@@ -717,7 +736,7 @@ pub mod buffered_queue {
 
             self.cold_list.drain_unchecked(decision);
 
-            self.iter_idx.store(usize::MAX as usize, Ordering::Release);
+            self.iter_idx.store(NO_ITER_FLAG, Ordering::Release);
             true
         }
     }
@@ -727,12 +746,11 @@ pub mod buffered_queue {
     impl<T> Clone for QueueNode<T> {
         #[inline]
         fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
+            Self(self.0.clone())
+        }
     }
 
     impl<T> QueueNode<T> {
-
         pub const NULL: QueueNode<T> = Self(null_mut());
 
         #[inline]
@@ -771,7 +789,10 @@ fn wait_while<F: Fn() -> bool>(f: F) {
 
 mod conc_linked_list {
     use core::{
-        mem::offset_of, ops::DerefMut, ptr::{null_mut, NonNull}, sync::atomic::{AtomicPtr, AtomicUsize, Ordering}
+        mem::offset_of,
+        ops::DerefMut,
+        ptr::{null_mut, NonNull},
+        sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     };
 
     #[cfg(feature = "no_std")]
@@ -822,7 +843,11 @@ mod conc_linked_list {
             }
         }
 
-        pub(crate) fn push_front_optimistic<F: Fn(&mut T)>(&self, val: T, f: F) -> NonNull<ConcLinkedListNode<T>> {
+        pub(crate) fn push_front_optimistic<F: Fn(&mut T)>(
+            &self,
+            val: T,
+            f: F,
+        ) -> NonNull<ConcLinkedListNode<T>> {
             let mut node = Box::new(ConcLinkedListNode::new(val));
             // call user provided setup routine
             f(&mut node.deref_mut().val);
@@ -934,7 +959,6 @@ mod conc_linked_list {
     }
 
     impl<T> ConcLinkedListNode<T> {
-
         pub const VAL_OFF: usize = offset_of!(ConcLinkedListNode<T>, val);
 
         #[inline]
