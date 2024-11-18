@@ -6,6 +6,7 @@
     feature(thread_local)
 )]
 #![feature(strict_provenance)]
+#![feature(core_intrinsics)]
 
 cfg_if! {
     if #[cfg(not(feature = "no_std"))] {

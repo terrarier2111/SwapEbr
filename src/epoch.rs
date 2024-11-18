@@ -28,7 +28,7 @@ use self::{conc_linked_list::ConcLinkedList, ring_buf::RingBuffer};
 
 static GLOBAL_INFO: GlobalInfo = GlobalInfo {
     cold: CachePadded::new(ColdGlobals {
-        pile: BufferedQueue::new(),
+        epochs: ConcLinkedList::new(),
         locals: BufferedQueue::new(),
     }),
     update_epoch: AtomicUsize::new(0),
@@ -41,8 +41,14 @@ struct GlobalInfo {
     min_safe_epoch: AtomicUsize,
 }
 
+#[repr(C)]
+struct EpochInstance {
+    cnt: usize,
+    pile: ConcLinkedList<Instance>,
+}
+
 struct ColdGlobals {
-    pile: BufferedQueue<32, Instance>,
+    epochs: ConcLinkedList<EpochInstance>, // FIXME: use ref counting for epochs
     // a list of all threads that have performed a pin call before
     locals: BufferedQueue<32, Inner>,
 }
@@ -143,7 +149,7 @@ fn destroy_local(local: *const Aligned<A2, Inner>) {
             }
         } else {
             // push garbage onto pile
-            GLOBAL_INFO.cold.pile.push(garbage.clone());
+            GLOBAL_INFO.cold.piles.push_front(garbage.clone());
         }
     }
     // if there are no more active references to the local
@@ -812,6 +818,8 @@ mod conc_linked_list {
         flags: AtomicUsize,
     }
 
+    // FIXME: maybe: put root and flags into the same word?! 
+
     const DRAIN_FLAG: usize = 1 << (usize::BITS as usize - 1);
 
     impl<T> ConcLinkedList<T> {
@@ -1070,6 +1078,105 @@ mod ring_buf {
         #[inline]
         fn len(&self) -> usize {
             self.src.len() - self.idx
+        }
+    }
+}
+
+mod counter_queue {
+    use core::{arch::x86_64::cmpxchg16b, cell::UnsafeCell, marker::PhantomData, ptr::null_mut, sync::atomic::{AtomicU64, Ordering}};
+    use std::intrinsics::{atomic_load_acquire, atomic_load_relaxed, atomic_load_seqcst};
+
+    pub trait WriteCnt {
+        fn write_cnt(&self, cnt: usize);
+
+        fn try_write_cnt(&self, curr: usize, new: usize) -> bool;
+    }
+
+    pub struct CounterQueue<T: >(UnsafeCell<Inner>, PhantomData<T>);
+
+    #[repr(C)]
+    struct Inner {
+        counter: u64,
+        ptr: *mut (),
+        _pad: [u8; size_of::<u64>() - size_of::<*mut ()>()],
+    }
+
+    #[repr(C)]
+    struct Node {
+        weak_cnt: u32,
+        strong_cnt: u32,
+        next_node: *mut (),
+        ptr: *mut (),
+    }
+
+    impl<T> CounterQueue<T> {
+
+        pub const fn new() -> Self {
+            Self(UnsafeCell::new(Inner { counter: 0, ptr: null_mut(), _pad: [0; size_of::<u64>() - size_of::<*mut ()>()] }), PhantomData)
+        }
+
+        fn split_large_val(val: u128) -> (u64, *mut ()) {
+            ((val & (u64::MAX as u128)) as u64, (val >> u64::BITS) as u64 as usize as *mut ())
+        }
+
+        pub fn push(&self, ptr: *mut ()) {
+            let mut prev_word = unsafe { faa_first_word_16b(self.0.get().cast::<u128>(), 1, Ordering::AcqRel) };
+            loop {
+                let (prev_cnt, prev_ptr) = Self::split_large_val(prev_word);
+                let (new_cnt, new_ptr) = Self::split_large_val(unsafe { load_16b(self.0.get().cast::<u128>(), Ordering::Acquire) });
+                // handle cases in which somebody else also tries to push a value and wins the race against us
+                if new_ptr != prev_ptr {
+                    // FIXME: fetch_sub our counter once again and then fetch_add 1 to the new counter - MAYBE: give up and join the newly found epoch instead of creating or own epoch:
+                    // FIXME: BUT: DO WE ALREADY SEE EVERYTHING WE HAVE TO HAVE SEEN IN THE NEW EPOCH IN ORDER TO NOT GET UB???
+                    unsafe { AtomicU64::from_ptr(prev_ptr.cast::<u64>()).fetch_sub(1, Ordering::AcqRel); }
+                    prev_word = unsafe { faa_first_word_16b(self.0.get().cast::<u128>(), 1, Ordering::AcqRel) };
+                    continue;
+                }
+                // FIXME: compare internal counters (strong cnt and weak cnt with the new weak cnt being prev_cnt + 1)
+
+                // FIXME: ensure overflow is properly handled!
+                let inner = unsafe { AtomicU64::from_ptr(ptr.cast::<u64>()).fetch_add(1, Ordering::AcqRel) };
+                
+                
+                let result = unsafe { cmpxchg16b(self.0.get().cast::<u128>(), 1 as u128 | ((prev_ptr as usize as u128) << u64::BITS), 0 | ((ptr as usize as u128) << u64::BITS), Ordering::AcqRel, Ordering::Acquire) };
+                if result != ((prev_cnt + 1) as u128) | ((prev_ptr as usize as u128) << u64::BITS) {
+                    // successful exchange!
+                }
+                break;
+            }
+        }
+
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[inline]
+    fn check_cmpxchg_16b_available() -> bool {
+        is_x86_feature_detected!("cmpxchg16b")
+    }
+
+    unsafe fn load_16b(src: *mut u128, ord: Ordering) -> u128 {
+        match ord {
+            Ordering::Acquire => unsafe { atomic_load_acquire(src) },
+            Ordering::SeqCst => unsafe { atomic_load_seqcst(src) },
+            Ordering::Relaxed => unsafe { atomic_load_relaxed(src) },
+            _ => unreachable!(),
+        }
+    }
+
+    /// this function implements overflow semantics for additions that would overflow the first word to only every affect the first word but never the second one
+    unsafe fn faa_first_word_16b(dst: *mut u128, add: u64, ord: Ordering) -> u128 {
+        let mut curr = match ord {
+            Ordering::AcqRel | Ordering::Acquire => unsafe { atomic_load_acquire(dst) },
+            Ordering::SeqCst => unsafe { atomic_load_seqcst(dst) },
+            Ordering::Relaxed => unsafe { atomic_load_relaxed(dst) },
+            _ => unreachable!(),
+        };
+        loop {
+            let new = unsafe { cmpxchg16b(dst, curr, (curr & !(u64::MAX as u128)) | (((curr & (u64::MAX as u128)) as u64 + add) as u128), ord, Ordering::Acquire) };
+            if new == curr {
+                return curr;
+            }
+            curr = new;
         }
     }
 }
